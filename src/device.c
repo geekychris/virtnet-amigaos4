@@ -601,64 +601,60 @@ static BOOL vn_invoke_copy_from(struct VirtnetBase *base,
  * refill the slot. Called from the unit task on IRQ signal. */
 static void vn_process_rx(struct VirtnetBase *base)
 {
-    if (!base->rx_ring || !base->bar0 || !base->IUtility) return;
-    /* Phase 8d: RX re-enabled. With sana2_hook path handling delivery
-     * via a real Hook+SANA2CopyHookMsg, RX-side crash risk goes down. */
+    if (!base->rx_vring || !base->IUtility) return;
     struct ExecIFace *IExec = base->IExec;
-    volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
 
-    ULONG dd_seen_this_call = 0;
-    for (int slot = 0; slot < VN_RING_ENTRIES; slot++) {
-        volatile UBYTE *rd = (volatile UBYTE *)base->rx_ring + slot * VN_DESC_SIZE;
+    UWORD num = base->rx_vring_num;
+    /* Struct-locate the descriptor table, avail ring, used ring, and
+     * used ring's ring[] array. Layout per virtio 0.9.5 §2.4.2 —
+     * these offsets are computed by the VRING_*_OFFSET macros. */
+    struct vring_desc *desc = (struct vring_desc *)base->rx_vring;
+    UBYTE *avail_bytes = ((UBYTE *)base->rx_vring) + VRING_AVAIL_OFFSET(num);
+    struct vring_avail_header *avail = (struct vring_avail_header *)avail_bytes;
+    UWORD *avail_ring = (UWORD *)(avail_bytes + 4);
+    UBYTE *used_bytes  = ((UBYTE *)base->rx_vring) + VRING_USED_OFFSET(num);
+    struct vring_used_header *used = (struct vring_used_header *)used_bytes;
+    struct vring_used_elem *used_ring = (struct vring_used_elem *)(used_bytes + 4);
 
-        /* PPC 460EX PCI DMA is not snoopy on sam460ex — HW writes to
-         * descriptor + rx_buffer in RAM bypass the CPU L1 cache. Using
-         * `volatile` re-issues the load instruction but doesn't force
-         * a cache miss. Invalidate (no writeback) so our next read
-         * fetches HW's fresh value from RAM. CACRF_InvalidateD, not
-         * CACRF_ClearD — Clear does writeback-then-invalidate, which
-         * would push our previous-round `rd[12]=0` back to RAM ON TOP
-         * of HW's just-set DD=1, losing every frame. */
-        IExec->CacheClearE((APTR)rd, VN_DESC_SIZE, CACRF_InvalidateD);
+    /* Memory barrier before reading device-owned idx — the device may
+     * have written to used->idx concurrently with our IRQ arriving. */
+    __asm__ volatile ("eieio; sync" : : : "memory");
+    UWORD cur_used_idx = used->idx;
+    UWORD last = base->rx_last_used;
+    ULONG delivered = 0;
 
-        if (!(rd[12] & 0x01)) continue;    /* not done */
-        dd_seen_this_call++;
+    while (last != cur_used_idx) {
+        UWORD slot = last % num;
+        UWORD desc_idx = (UWORD)used_ring[slot].id;
+        ULONG bytes_used = used_ring[slot].len;
 
-        ULONG frame_len = ((ULONG)rd[9] << 8) | (ULONG)rd[8];
-        if (frame_len < 14 || frame_len > VN_RX_BUFSIZE) {
-            rd[12] = 0;
-            /* Flush our clear to RAM so HW starts this slot fresh
-             * next time it writes here — CACRF_ClearD is writeback+
-             * invalidate, safe here because HW hasn't touched the
-             * slot again yet (we hold it until we bump RDT below). */
-            IExec->CacheClearE((APTR)rd, VN_DESC_SIZE, CACRF_ClearD);
-            e1000_write32(mmio, E1000_REG_RDT, slot);
+        /* Sanity: descriptor index must fit in queue. Guard against
+         * a misbehaving device (or our own bookkeeping bug). */
+        if (desc_idx >= num) {
+            base->process_rx_dd_seen++;   /* misdirected — count and skip */
+            last++;
             continue;
         }
-        UBYTE *rxbuf = (UBYTE *)base->rx_buffers + slot * VN_RX_BUFSIZE;
-        /* Same story for the frame buffer: HW wrote frame bytes to
-         * RAM, our cache still holds stale bytes from init or a
-         * previous shorter frame. Bytes past the first cache line
-         * come back wrong without this — ping data corrupts at
-         * offset 8 (which lands past the first 32-byte cache line
-         * inside the ICMP payload region). */
-        IExec->CacheClearE(rxbuf, frame_len, CACRF_InvalidateD);
+        /* virtio-net prepends VIRTIO_NET_HDR_LEN (10) bytes before
+         * the Ethernet frame. bytes_used includes both. Payload
+         * (Ethernet frame including header) length = bytes_used - 10. */
+        if (bytes_used < VIRTIO_NET_HDR_LEN + 14) {
+            /* Short frame — no Ethernet header could fit. Refill slot. */
+            last++;
+            /* Push descriptor back onto avail. */
+            avail_ring[avail->idx % num] = desc_idx;
+            __asm__ volatile ("eieio; sync" : : : "memory");
+            avail->idx++;
+            continue;
+        }
 
-        ULONG payload_len = frame_len - 14;
+        UBYTE *rxbuf = (UBYTE *)base->rx_bufs + (desc_idx * VN_RX_BUFSIZE);
+        UBYTE *eth   = rxbuf + VIRTIO_NET_HDR_LEN;   /* skip virtio hdr */
+        ULONG eth_len = bytes_used - VIRTIO_NET_HDR_LEN;
+        ULONG payload_len = eth_len - 14;
 
-        BOOL delivered_this_slot = FALSE;
-
-        /* PHASE 7L (SANA2HOOK delivery) — DISABLED in phase 7q.
-         * We were calling the caller-supplied hook with schm_To=NULL,
-         * meaning Roadshow's hook wrote our packet payload into a
-         * NULL destination. Likely responsible for the crash-on-first-RX
-         * we hit in phase 7L. Real S2_SANA2HOOK delivery needs a
-         * proper destination buffer strategy — Roadshow-owned tag list
-         * to consult, or driver-owned buffer pool. Revisit once
-         * CMD_READ path is validated end-to-end. */
-
-        /* Find any opener with a queued CMD_READ. First-come, first-serve
-         * for now — no ethertype filtering (Phase 6l). */
+        /* Find any opener with a queued CMD_READ. FCFS across all
+         * openers. No ethertype filtering yet. */
         struct IOSana2Req *ioreq = NULL;
         struct V1000Opener *op   = NULL;
         IExec->ObtainSemaphore(&base->opener_lock);
@@ -673,32 +669,38 @@ static void vn_process_rx(struct VirtnetBase *base)
         }
         IExec->ReleaseSemaphore(&base->opener_lock);
 
-        if (ioreq && op && op->copy_to_buff && ioreq->ios2_Data) {
-            /* Populate ios2 fields, invoke CopyToBuff hook, reply. */
-            for (int i = 0; i < 6; i++) ioreq->ios2_SrcAddr[i] = rxbuf[6 + i];
-            for (int i = 0; i < 6; i++) ioreq->ios2_DstAddr[i] = rxbuf[i];
-            ioreq->ios2_PacketType = ((ULONG)rxbuf[12] << 8) | (ULONG)rxbuf[13];
+        if (ioreq && op && ioreq->ios2_Data) {
+            for (int i = 0; i < 6; i++) ioreq->ios2_SrcAddr[i] = eth[6 + i];
+            for (int i = 0; i < 6; i++) ioreq->ios2_DstAddr[i] = eth[i];
+            ioreq->ios2_PacketType = ((ULONG)eth[12] << 8) | (ULONG)eth[13];
             ioreq->ios2_DataLength = payload_len;
 
-            BOOL ok = vn_invoke_copy_to(base, op, ioreq, rxbuf + 14, payload_len);
+            BOOL ok = vn_invoke_copy_to(base, op, ioreq, eth + 14, payload_len);
             ioreq->ios2_Req.io_Error = ok ? 0 : S2ERR_NO_RESOURCES;
             IExec->ReplyMsg((struct Message *)ioreq);
-            delivered_this_slot = ok;
+            if (ok) delivered++;
         }
-        if (delivered_this_slot) base->process_rx_delivered++;
-        /* Whether we delivered or not, free the slot for HW reuse.
-         * MUST flush the write to RAM (CACRF_ClearD) before bumping
-         * RDT — otherwise HW can DMA a new frame + set DD=1 in RAM
-         * while our cached DD=0 sits dirty. Next iteration's
-         * InvalidateD would then discard the (unflushed) 0, but that
-         * only masks the issue; a well-timed HW write between our
-         * dirty-cache and the invalidate could still be seen twice. */
-        rd[12] = 0;
-        IExec->CacheClearE((APTR)rd, VN_DESC_SIZE, CACRF_ClearD);
-        /* Bump RDT to hand this slot back. */
-        e1000_write32(mmio, E1000_REG_RDT, slot);
+
+        /* Refill: push same descriptor back onto avail. Buffer stays
+         * valid — we just told the device it can DMA into it again. */
+        avail_ring[avail->idx % num] = desc_idx;
+        __asm__ volatile ("eieio; sync" : : : "memory");
+        avail->idx++;
+        last++;
     }
-    base->process_rx_dd_seen = dd_seen_this_call;
+
+    base->rx_last_used = last;
+    base->process_rx_delivered += delivered;
+
+    if (delivered > 0 || last != base->rx_last_used) {
+        /* We refilled some descriptors — kick RX queue so the device
+         * knows more buffers are available. Only strictly required if
+         * the device paused after running out of buffers, but the
+         * spec allows unnecessary kicks (they're just no-ops on the
+         * device side). */
+        __asm__ volatile ("eieio; sync" : : : "memory");
+        virtio_notify_queue(base, VIRTIO_NET_Q_RX);
+    }
 }
 
 /* -------- Phase 5b: ISR ----------
@@ -725,23 +727,25 @@ static uint32 vn_isr(struct ExceptionContext *ctx,
     struct VirtnetBase *base = (struct VirtnetBase *)is_Data;
     (void)ctx; (void)sysbase;
 
-    volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
-    uint32 icr = e1000_read32(mmio, E1000_REG_ICR);
-    if (icr == 0)
-        return 0;               /* not ours (or nothing pending) */
+    /* virtio legacy: read VIRTIO_PCI_ISR. It's read-to-clear.
+     * bit 0 = queue-used advanced, bit 1 = config changed. If both
+     * zero, this IRQ isn't for us (shared INTx). */
+    if (!base->io_base) return 0;
+    UBYTE isr = base->pciDevice->InByte(base->io_base + VIRTIO_PCI_ISR);
+    if (isr == 0) return 0;
 
     base->irq_counter++;
-    base->last_icr = icr;
+    base->last_icr = (uint32)isr;   /* reuse existing DBG field for compat */
 
-    /* Phase 6k: on RX (RXT0 bit 7), wake the unit task so it can
-     * ProcessRX in task context. ISR context is limited to Signal-safe
-     * ops — no ring walking here. Also on link-status change (LSC)
-     * we could signal, but nothing consumes that yet. */
-    if ((icr & (1U << 7)) && base->unit_task && base->unit_signal_mask) {
+    /* On queue interrupt, wake unit task to drain used ring.
+     * Ring walking is not ISR-safe (Alloc/semaphore/etc.). */
+    if ((isr & VIRTIO_ISR_QUEUE) && base->unit_task && base->unit_signal_mask) {
         struct ExecIFace *IExec = base->IExec;
         IExec->Signal(base->unit_task, base->unit_signal_mask);
     }
-    return 1;                   /* claimed */
+    /* VIRTIO_ISR_CONFIG (bit 1) would fire on link-status change
+     * etc. — nothing consumes it yet, so just log via last_icr. */
+    return 1;
 }
 
 /* STATUS register bits (§2 of DESIGN.md, e1000x_regs.h:STATUS_*) */
@@ -1182,6 +1186,32 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
 
         devBase->rx_next_avail = (UWORD)num;
         devBase->rx_last_used  = 0;
+    }
+
+    /* -------- Phase 10f: TX scratch buffer ----------
+     * Single buffer big enough for one virtio_net_hdr + max Ethernet
+     * frame (1514 bytes payload including header + 10-byte hdr = 1524).
+     * Round to 2 KB for cache-line safety. All TX packets use this
+     * single buffer + descriptor 0, serialized by the SANA-II dispatch
+     * layer. */
+    {
+        devBase->tx_scratch2 = iexec->AllocVecTags(VN_RX_BUFSIZE,
+            AVT_Type,              MEMF_SHARED,
+            AVT_Contiguous,        TRUE,
+            AVT_PhysicalAlignment, TRUE,
+            AVT_Alignment,         16,
+            AVT_ClearWithValue,    0,
+            TAG_END);
+        if (!devBase->tx_scratch2) {
+            LOGF(log, (CONST_STRPTR)"virtio: tx_scratch2 alloc FAILED\n");
+            vn_log_close(iexec, &log);
+            return (struct Library *)devBase;
+        }
+        devBase->tx_scratch2_phys = vn_dma_phys(iexec, devBase->tx_scratch2,
+                                                VN_RX_BUFSIZE, DMA_ReadFromRAM);
+        LOGF(log, (CONST_STRPTR)"virtio tx_scratch2: cpu=%p phys=%08lx (%lu bytes)\n",
+             devBase->tx_scratch2, (ULONG)devBase->tx_scratch2_phys,
+             (ULONG)VN_RX_BUFSIZE);
     }
 
     /* -------- Phase 10e: install IRQ + flip DRIVER_OK ----------
@@ -2223,24 +2253,28 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
     case VN_DBG_SEND:
     case CMD_WRITE:
     case S2_BROADCAST: {
-        /* Phase 6b/e/f — TX PARTIALLY IMPLEMENTED, blocked on two issues:
+        /* Phase 10f: virtio TX path.
          *
-         *   1. CMD_WRITE (io_Command=3) and S2_BROADCAST (17) never reach
-         *      this case via DoIO/SendIO/direct-BeginIO — OS4 exec rejects
-         *      with IOERR_UNITBUSY (-6) before dispatch. Discriminator is
-         *      io_Command-value based; not io_Flags, not io_Unit struct,
-         *      not MsgPort mode. Private cmds 0xF001..0xF003 dispatch
-         *      fine, 0xF010 doesn't. See memory os4-doio-ioflags-quirks.
+         * Layout in tx_scratch2:
+         *   bytes [0..9]  = virtio_net_hdr (all zero — no GSO, no CSUM,
+         *                                    no MRG since we didn't
+         *                                    negotiate those features)
+         *   bytes [10..]  = Ethernet frame
          *
-         *   2. Even when reached via VN_DBG_SEND (0xF003), the full TX
-         *      code path either drops the descriptor silently (TDH advances
-         *      but STATUS.DD never sets, TPT stays 0) or hangs the caller
-         *      when we add IExec->CachePreDMA/CachePostDMA. Root cause
-         *      not identified.
+         * Steps:
+         *   1. Sanity-check state + size + buffer.
+         *   2. Build the frame in tx_scratch2 (either via CopyFromBuff
+         *      hook for cooked mode, or direct copy for RAW).
+         *   3. Fill TX descriptor 0 with buffer_addr = tx_scratch2 phys,
+         *      len = 10 + frame_bytes, flags = 0 (device-read).
+         *   4. Push descriptor index 0 onto avail ring, bump idx, barrier.
+         *   5. Kick TX queue (virtio_notify_queue).
+         *   6. Poll used-ring briefly for completion so we can reuse
+         *      the descriptor on next TX.
          *
-         * Current behavior: report dispatch success but do nothing. Real
-         * TX code lives in the #if 0 block below, preserved for the next
-         * debugging session. */
+         * Single-descriptor design is deliberate: we serialise TX at
+         * the SANA-II layer (dispatched from unit task, one at a time),
+         * so no need for a full ring. Multi-descriptor TX = Phase 10i. */
 
         if (devBase->state != VN_STATE_ONLINE) {
             ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
@@ -2248,28 +2282,22 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
             break;
         }
 
-        /* Frame length sanity: 60 bytes minimum (pad-to-min handled by
-         * PSP in TCTL) up to RawMTU=1514. */
         ULONG len = ioreq->ios2_DataLength;
         if (len == 0 || len > 1514 || !ioreq->ios2_Data ||
-            !devBase->rx_ring /* proxy for "rings alloc succeeded" */) {
+            !devBase->tx_scratch2 || !devBase->tx_vring) {
             ioreq->ios2_Req.io_Error = S2ERR_MTU_EXCEEDED;
             ioreq->ios2_WireError    = S2WERR_GENERIC_ERROR;
             break;
         }
         ioreq->ios2_WireError = 0;
 
-        /* Two shapes: COOKED (opener has hook) or RAW (memcpy).
-         * Use the dedicated tx_scratch buffer — NOT rx_buffers[slot],
-         * which is what the RX ring's descriptor also points at. Sharing
-         * caused HW TX-read to race with HW RX-write when a reply frame
-         * arrived during outbound send. */
-        if (!devBase->tx_scratch) {
-            ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
-            break;
-        }
-        ULONG slot = devBase->tx_next_slot;         /* TX descriptor index */
-        UBYTE *dst = (UBYTE *)devBase->tx_scratch;  /* dedicated frame buf */
+        UBYTE *dst = (UBYTE *)devBase->tx_scratch2;
+
+        /* Zero virtio_net_hdr[0..9]. */
+        for (int i = 0; i < VIRTIO_NET_HDR_LEN; i++) dst[i] = 0;
+
+        /* Ethernet frame starts at dst + VIRTIO_NET_HDR_LEN. */
+        UBYTE *eth = dst + VIRTIO_NET_HDR_LEN;
 
         struct V1000Opener *op = NULL;
         if (ioreq->ios2_BufferManagement) {
@@ -2280,101 +2308,67 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
         BOOL cooked = (op != NULL) && (devBase->IUtility != NULL) &&
                       (op->sana2_hook != NULL || op->copy_from_buff != NULL);
 
+        ULONG eth_len;
         if (cooked) {
-            /* Build 14-byte Ethernet header */
-            for (int i = 0; i < 6; i++) dst[i]     = ioreq->ios2_DstAddr[i];  /* dst */
-            for (int i = 0; i < 6; i++) dst[6 + i] = devBase->mac[i];         /* src */
+            for (int i = 0; i < 6; i++) eth[i]     = ioreq->ios2_DstAddr[i];
+            for (int i = 0; i < 6; i++) eth[6 + i] = devBase->mac[i];
             uint16 etype = (uint16)(ioreq->ios2_PacketType & 0xFFFF);
-            dst[12] = (UBYTE)(etype >> 8);
-            dst[13] = (UBYTE)(etype & 0xFF);
-
-            /* Pull payload via the caller's CopyFromBuff hook. ABI
-             * selected by op->copy_from_tag (Hook via CallHookPkt for
-             * -16/-32 variants; classic 68k asm via EmulateTags for
-             * plain S2_CopyFromBuff). */
-            BOOL ok = vn_invoke_copy_from(devBase, op, ioreq, dst + 14, len);
+            eth[12] = (UBYTE)(etype >> 8);
+            eth[13] = (UBYTE)(etype & 0xFF);
+            BOOL ok = vn_invoke_copy_from(devBase, op, ioreq, eth + 14, len);
             if (!ok) {
                 ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
                 ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;
                 break;
             }
-            /* Frame length now includes the Ethernet header. Explicitly
-             * zero-pad to the 60-byte Ethernet minimum. Manual byte-at-a-
-             * time — a plain while-loop optimizes to memset() which pulls
-             * newlib into a resident driver and fails to link. */
-            len = 14 + len;
-            volatile UBYTE *pad = dst;   /* volatile stops the memset
-                                          * optimization */
-            for (ULONG i = len; i < 60; i++) pad[i] = 0;
-            if (len < 60) len = 60;
+            eth_len = 14 + len;
         } else {
-            /* RAW: caller supplied full L2 frame in ios2_Data. */
             UBYTE *src = (UBYTE *)ioreq->ios2_Data;
-            for (ULONG i = 0; i < len; i++) dst[i] = src[i];
+            for (ULONG i = 0; i < len; i++) eth[i] = src[i];
+            eth_len = len;
         }
+        /* Minimum Ethernet frame = 60 bytes (padding). Virtio devices
+         * are usually happy without it, but keep it for compatibility. */
+        volatile UBYTE *pad = eth;
+        for (ULONG i = eth_len; i < 60; i++) pad[i] = 0;
+        if (eth_len < 60) eth_len = 60;
 
-        /* Physical addr of the TX scratch. StartDMA also flushes the
-         * data cache — critical since we just wrote the frame bytes.
-         * Pair with EndDMA after we're sure HW is done. */
-        ULONG frame_len_io = len;
-        uint32 buf_phys = vn_dma_phys(IExec, dst, len, DMA_ReadFromRAM);
-        if (!buf_phys) {
-            ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
-            break;
-        }
+        ULONG total_bytes = VIRTIO_NET_HDR_LEN + eth_len;
 
-        /* Build descriptor at tx_ring[slot]. buffer_addr = PHYSICAL. */
-        volatile UBYTE *d = (volatile UBYTE *)devBase->tx_ring + (slot * VN_DESC_SIZE);
-        poke_le32(d +  0, buf_phys);
-        poke_le32(d +  4, 0);
-        poke_le32(d +  8, (uint32)len
-                          | ((uint32)(E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS
-                                      | E1000_TXD_CMD_RS) << 24));
-        poke_le32(d + 12, 0);
+        /* Fill TX descriptor 0. Buffer phys addr resolved at Init. */
+        struct vring_desc *tdesc = (struct vring_desc *)devBase->tx_vring;
+        tdesc[0].addr_lo = devBase->tx_scratch2_phys;
+        tdesc[0].addr_hi = 0;
+        tdesc[0].len     = total_bytes;
+        tdesc[0].flags   = 0;   /* device-read, single-buffer */
+        tdesc[0].next    = 0;
 
-        /* Full memory barrier — ensures descriptor writes hit RAM before
-         * the doorbell tells HW to start reading. pa6t_eth does the same. */
-        vn_wmb();
+        /* Push descriptor 0 onto TX avail ring. */
+        UWORD tx_num = devBase->tx_vring_num;
+        UBYTE *tavail_bytes = ((UBYTE *)devBase->tx_vring) + VRING_AVAIL_OFFSET(tx_num);
+        struct vring_avail_header *tavail = (struct vring_avail_header *)tavail_bytes;
+        UWORD *tavail_ring = (UWORD *)(tavail_bytes + 4);
+        tavail_ring[tavail->idx % tx_num] = 0;
+        __asm__ volatile ("eieio; sync" : : : "memory");
+        tavail->idx++;
+        __asm__ volatile ("eieio; sync" : : : "memory");
+        virtio_notify_queue(devBase, VIRTIO_NET_Q_TX);
 
-        /* Bump TDT — TX doorbell. HW pulls the descriptor + frame. */
-        volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        ULONG new_tdt = (slot + 1) % VN_RING_ENTRIES;
-        e1000_write32(mmio, E1000_REG_TDT, new_tdt);
-        devBase->tx_next_slot = new_tdt;
-
-        /* Poll for STATUS.DD briefly. Under QEMU emulation each spin
-         * iteration is ~100ns; 100k = 10ms per packet was noticeable
-         * when Roadshow sends bursts of ARP + ping. Trim to 5k (~0.5ms).
-         * Descriptor's DD should be set within a few reads for a
-         * paravirtualized NIC. */
+        /* Poll TX used ring briefly. Device usually completes within
+         * a few reads for a single-buffer packet. If not, we still
+         * reply successfully (device will eventually process it),
+         * because virtio TX is asynchronous — the buffer is device-
+         * owned until we see it come back on used ring. */
+        UBYTE *tused_bytes = ((UBYTE *)devBase->tx_vring) + VRING_USED_OFFSET(tx_num);
+        struct vring_used_header *tused = (struct vring_used_header *)tused_bytes;
+        UWORD want_idx = tavail->idx;
         BOOL done = FALSE;
-        for (int i = 0; i < 5000; i++) {
-            if (d[12] & E1000_TXD_STAT_DD) { done = TRUE; break; }
-            __asm__ volatile ("" : : : "memory");
+        for (int i = 0; i < 10000; i++) {
+            __asm__ volatile ("eieio; sync" : : : "memory");
+            if (tused->idx == want_idx) { done = TRUE; break; }
         }
-
-        /* Release the DMA hold on the frame buffer. */
-        IExec->EndDMA(dst, frame_len_io, DMA_ReadFromRAM);
-        /* Stash more diagnostic state: TDH, TDT, descriptor status byte,
-         * TCTL — so testtx can see what HW did. */
-        uint32 tdh_now  = e1000_read32(mmio, E1000_REG_TDH);
-        uint32 tdt_now  = e1000_read32(mmio, E1000_REG_TDT);
-        uint32 tctl_now = e1000_read32(mmio, E1000_REG_TCTL);
-        UBYTE  stat_byte = d[12];
-        /* Pack into ios2 fields:
-         *   ios2_DataLength = TDH | (TDT << 16)
-         *   ios2_PacketType = tctl
-         *   ios2_WireError  = status_byte | (done << 8) | 0x7000
-         */
-        ioreq->ios2_DataLength = (ULONG)tdh_now | ((ULONG)tdt_now << 16);
-        ioreq->ios2_PacketType = tctl_now;
-        ioreq->ios2_WireError  = ((ULONG)stat_byte)
-                               | ((ULONG)(done ? 1 : 0) << 8)
-                               | 0x7000;
-
-        if (!done) {
-            ioreq->ios2_Req.io_Error = IOERR_UNITBUSY;
-        }
+        (void)done;
+        /* Bookkeeping only — TX completion doesn't gate our reply. */
         break;
     }
 
