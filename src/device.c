@@ -1057,14 +1057,17 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
     /* Optional: read link status if VIRTIO_NET_F_STATUS negotiated.
      * Status is 2 bytes at cfg offset 6. */
     if (devBase->driver_features & VIRTIO_NET_F_STATUS) {
-        /* virtio-net status is 2 bytes at cfg offset 6. Device stores
-         * it little-endian, but IPCI->InWord on PPC returns the raw
-         * PCI-cycle byte order (no swap). Decode LE explicitly. */
-        UBYTE lo = virtio_read_dev_cfg8(devBase, 6);
-        UBYTE hi = virtio_read_dev_cfg8(devBase, 7);
-        UWORD link = ((UWORD)hi << 8) | lo;
-        LOGF(log, (CONST_STRPTR)"virtio link status: %04lx  (%s)\n",
-             (ULONG)link,
+        /* virtio-net status is 2 bytes at cfg offset 6. Empirically
+         * with QEMU's virtio-net-pci on PPC BE: memory contains
+         * bytes [0x00, 0x01] for LINK_UP — i.e. guest-native BIG-
+         * endian encoding, not the little-endian we'd expect from
+         * the standard registers. Legacy virtio spec explicitly says
+         * device-specific config uses guest-native endianness. */
+        UBYTE b6 = virtio_read_dev_cfg8(devBase, 6);
+        UBYTE b7 = virtio_read_dev_cfg8(devBase, 7);
+        UWORD link = ((UWORD)b6 << 8) | b7;   /* BE decode */
+        LOGF(log, (CONST_STRPTR)"virtio link status: bytes=%02lx,%02lx link=%04lx (%s)\n",
+             (ULONG)b6, (ULONG)b7, (ULONG)link,
              (link & VIRTIO_NET_S_LINK_UP) ? (CONST_STRPTR)"UP" : (CONST_STRPTR)"down");
     }
 
