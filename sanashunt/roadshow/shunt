@@ -1,0 +1,9 @@
+# DEVS:NetInterfaces/shunt - bind sanashunt.device on 10.0.2.16 so we
+# can see Roadshow's full command sequence via the shunt's log.
+DEVICE=DEVS:Networks/sanashunt.device
+UNIT=0
+ADDRESS=10.0.2.16
+NETMASK=255.255.255.0
+MTU=1500
+ID=shunt
+MULTICAST=NO
