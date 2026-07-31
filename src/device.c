@@ -1016,8 +1016,14 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * descriptor chain (header + frame linked via NEXT flag) and
      * QEMU rejects a single-descriptor TX with "bogus descriptor
      * or out of resources". */
+    /* Also accept VIRTIO_NET_F_MRG_RXBUF so we can use single-
+     * descriptor RX buffers. With MRG, virtio_net_hdr grows to 12
+     * bytes (adds num_buffers field). Without MRG (and without
+     * ANY_LAYOUT effective for RX), QEMU expects RX to be a 2-desc
+     * chain: header slot + data slot — causing "bogus descriptor"
+     * when we present single-desc RX buffers. */
     ULONG want_feat = VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS
-                    | VIRTIO_F_ANY_LAYOUT;
+                    | VIRTIO_F_ANY_LAYOUT | VIRTIO_NET_F_MRG_RXBUF;
     virtio_negotiate_features(devBase, want_feat);
     LOGF(log, (CONST_STRPTR)"virtio: device_features=%08lx driver_wants=%08lx accepted=%08lx\n",
          (ULONG)devBase->device_features, (ULONG)want_feat,
@@ -1180,23 +1186,18 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
             vio_le16_put(&desc[i].flags, VRING_DESC_F_WRITE);
             vio_le16_put(&desc[i].next, 0);
         }
-        /* Populate avail ring. Its bytes live at offset
-         * VRING_AVAIL_OFFSET(num) within rx_vring; the ring[] array
-         * starts at the header's 4-byte prefix (flags+idx). */
+        /* PHASE 10j-2 DIAGNOSTIC: SKIP RX avail-ring population.
+         * Leave avail_idx=0 so QEMU sees no RX buffers ready. If
+         * "bogus descriptor" still appears on TX-notify, error is
+         * definitively TX-side. If error disappears entirely, error
+         * was from QEMU popping our RX descriptors. */
         UBYTE *avail_bytes = ((UBYTE *)devBase->rx_vring) + VRING_AVAIL_OFFSET(num);
         struct vring_avail_header *avail = (struct vring_avail_header *)avail_bytes;
-        uint16 *avail_ring = (uint16 *)(avail_bytes + 4);
         vio_le16_put(&avail->flags, 0);
-        for (ULONG i = 0; i < num; i++) {
-            vio_le16_put(&avail_ring[i], (uint16)i);
-        }
-        /* Publish avail-idx = num so device sees all descriptors as
-         * ready. Barrier before + after the idx bump. */
-        __asm__ volatile ("eieio; sync" : : : "memory");
-        vio_le16_put(&avail->idx, (uint16)num);
+        vio_le16_put(&avail->idx, 0);
         __asm__ volatile ("eieio; sync" : : : "memory");
 
-        devBase->rx_next_avail = (UWORD)num;
+        devBase->rx_next_avail = 0;
         devBase->rx_last_used  = 0;
     }
 
@@ -1251,6 +1252,11 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         }
     }
 
+    /* PHASE 10j FINDING: with DRIVER_OK skipped, QEMU never emits
+     * "bogus descriptor" — confirming the error is triggered by ring
+     * processing post-DRIVER_OK (specifically, our TX notify or
+     * QEMU's RX-pop at driver-up time). Re-enable DRIVER_OK now that
+     * we know where the trigger lives. */
     virtio_driver_ok(devBase);
     LOGF(log, (CONST_STRPTR)"virtio: DRIVER_OK set, status=%02lx (device may now use queues)\n",
          (ULONG)virtio_read_status(devBase));
