@@ -605,56 +605,46 @@ static void vn_process_rx(struct VirtnetBase *base)
     struct ExecIFace *IExec = base->IExec;
 
     UWORD num = base->rx_vring_num;
-    /* Struct-locate the descriptor table, avail ring, used ring, and
-     * used ring's ring[] array. Layout per virtio 0.9.5 §2.4.2 —
-     * these offsets are computed by the VRING_*_OFFSET macros. */
-    struct vring_desc *desc = (struct vring_desc *)base->rx_vring;
+    /* All ring fields are LITTLE-ENDIAN on QEMU virtio-net-pci —
+     * use vio_le*_get / vio_le*_put to access them from BE PPC. */
     UBYTE *avail_bytes = ((UBYTE *)base->rx_vring) + VRING_AVAIL_OFFSET(num);
     struct vring_avail_header *avail = (struct vring_avail_header *)avail_bytes;
-    UWORD *avail_ring = (UWORD *)(avail_bytes + 4);
+    uint16 *avail_ring = (uint16 *)(avail_bytes + 4);
     UBYTE *used_bytes  = ((UBYTE *)base->rx_vring) + VRING_USED_OFFSET(num);
     struct vring_used_header *used = (struct vring_used_header *)used_bytes;
     struct vring_used_elem *used_ring = (struct vring_used_elem *)(used_bytes + 4);
 
-    /* Memory barrier before reading device-owned idx — the device may
-     * have written to used->idx concurrently with our IRQ arriving. */
+    /* Memory barrier before reading device-owned idx. */
     __asm__ volatile ("eieio; sync" : : : "memory");
-    UWORD cur_used_idx = used->idx;
+    UWORD cur_used_idx = vio_le16_get(&used->idx);
     UWORD last = base->rx_last_used;
     ULONG delivered = 0;
+    ULONG iterated = 0;
 
     while (last != cur_used_idx) {
+        iterated++;
         UWORD slot = last % num;
-        UWORD desc_idx = (UWORD)used_ring[slot].id;
-        ULONG bytes_used = used_ring[slot].len;
+        UWORD desc_idx = (UWORD)vio_le32_get(&used_ring[slot].id);
+        ULONG bytes_used = vio_le32_get(&used_ring[slot].len);
 
-        /* Sanity: descriptor index must fit in queue. Guard against
-         * a misbehaving device (or our own bookkeeping bug). */
         if (desc_idx >= num) {
-            base->process_rx_dd_seen++;   /* misdirected — count and skip */
+            base->process_rx_dd_seen++;
             last++;
             continue;
         }
-        /* virtio-net prepends VIRTIO_NET_HDR_LEN (10) bytes before
-         * the Ethernet frame. bytes_used includes both. Payload
-         * (Ethernet frame including header) length = bytes_used - 10. */
         if (bytes_used < VIRTIO_NET_HDR_LEN + 14) {
-            /* Short frame — no Ethernet header could fit. Refill slot. */
             last++;
-            /* Push descriptor back onto avail. */
-            avail_ring[avail->idx % num] = desc_idx;
+            vio_le16_put(&avail_ring[vio_le16_get(&avail->idx) % num], desc_idx);
             __asm__ volatile ("eieio; sync" : : : "memory");
-            avail->idx++;
+            vio_le16_put(&avail->idx, vio_le16_get(&avail->idx) + 1);
             continue;
         }
 
         UBYTE *rxbuf = (UBYTE *)base->rx_bufs + (desc_idx * VN_RX_BUFSIZE);
-        UBYTE *eth   = rxbuf + VIRTIO_NET_HDR_LEN;   /* skip virtio hdr */
+        UBYTE *eth   = rxbuf + VIRTIO_NET_HDR_LEN;
         ULONG eth_len = bytes_used - VIRTIO_NET_HDR_LEN;
         ULONG payload_len = eth_len - 14;
 
-        /* Find any opener with a queued CMD_READ. FCFS across all
-         * openers. No ethertype filtering yet. */
         struct IOSana2Req *ioreq = NULL;
         struct V1000Opener *op   = NULL;
         IExec->ObtainSemaphore(&base->opener_lock);
@@ -681,23 +671,17 @@ static void vn_process_rx(struct VirtnetBase *base)
             if (ok) delivered++;
         }
 
-        /* Refill: push same descriptor back onto avail. Buffer stays
-         * valid — we just told the device it can DMA into it again. */
-        avail_ring[avail->idx % num] = desc_idx;
+        /* Refill descriptor. */
+        vio_le16_put(&avail_ring[vio_le16_get(&avail->idx) % num], desc_idx);
         __asm__ volatile ("eieio; sync" : : : "memory");
-        avail->idx++;
+        vio_le16_put(&avail->idx, vio_le16_get(&avail->idx) + 1);
         last++;
     }
 
     base->rx_last_used = last;
     base->process_rx_delivered += delivered;
 
-    if (delivered > 0 || last != base->rx_last_used) {
-        /* We refilled some descriptors — kick RX queue so the device
-         * knows more buffers are available. Only strictly required if
-         * the device paused after running out of buffers, but the
-         * spec allows unnecessary kicks (they're just no-ops on the
-         * device side). */
+    if (iterated > 0) {
         __asm__ volatile ("eieio; sync" : : : "memory");
         virtio_notify_queue(base, VIRTIO_NET_Q_RX);
     }
@@ -1158,30 +1142,32 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         LOGF(log, (CONST_STRPTR)"virtio rx_bufs: cpu=%p phys=%08lx pool=%lu\n",
              devBase->rx_bufs, (ULONG)devBase->rx_bufs_phys, (ULONG)pool_bytes);
 
-        /* Populate descriptor table (starts at rx_vring + 0). */
+        /* Populate descriptor table. All ring fields are stored in
+         * LITTLE-ENDIAN — QEMU's transitional virtio-net-pci reads
+         * ring memory LE regardless of guest endianness. Use the
+         * vio_le*_put helpers so PPC BE writes byte-swap correctly. */
         struct vring_desc *desc = (struct vring_desc *)devBase->rx_vring;
         for (ULONG i = 0; i < num; i++) {
-            desc[i].addr_lo = devBase->rx_bufs_phys + (i * VN_RX_BUFSIZE);
-            desc[i].addr_hi = 0;
-            desc[i].len     = VN_RX_BUFSIZE;
-            desc[i].flags   = VRING_DESC_F_WRITE;
-            desc[i].next    = 0;
+            vio_le32_put(&desc[i].addr_lo, devBase->rx_bufs_phys + (i * VN_RX_BUFSIZE));
+            vio_le32_put(&desc[i].addr_hi, 0);
+            vio_le32_put(&desc[i].len, VN_RX_BUFSIZE);
+            vio_le16_put(&desc[i].flags, VRING_DESC_F_WRITE);
+            vio_le16_put(&desc[i].next, 0);
         }
         /* Populate avail ring. Its bytes live at offset
          * VRING_AVAIL_OFFSET(num) within rx_vring; the ring[] array
          * starts at the header's 4-byte prefix (flags+idx). */
         UBYTE *avail_bytes = ((UBYTE *)devBase->rx_vring) + VRING_AVAIL_OFFSET(num);
         struct vring_avail_header *avail = (struct vring_avail_header *)avail_bytes;
-        UWORD *avail_ring = (UWORD *)(avail_bytes + 4);
-        avail->flags = 0;
+        uint16 *avail_ring = (uint16 *)(avail_bytes + 4);
+        vio_le16_put(&avail->flags, 0);
         for (ULONG i = 0; i < num; i++) {
-            avail_ring[i] = (UWORD)i;
+            vio_le16_put(&avail_ring[i], (uint16)i);
         }
         /* Publish avail-idx = num so device sees all descriptors as
-         * ready. Barrier before + after the idx bump (writing to
-         * shared RAM the device may race us on). */
+         * ready. Barrier before + after the idx bump. */
         __asm__ volatile ("eieio; sync" : : : "memory");
-        avail->idx = (UWORD)num;
+        vio_le16_put(&avail->idx, (uint16)num);
         __asm__ volatile ("eieio; sync" : : : "memory");
 
         devBase->rx_next_avail = (UWORD)num;
@@ -1892,52 +1878,36 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
         ioreq->ios2_DataLength = devBase->irq_counter;
         ioreq->ios2_WireError  = devBase->last_icr;
         ioreq->ios2_PacketType = devBase->state;
-        if (devBase->state == VN_STATE_ONLINE && devBase->bar0) {
-            volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-            uint32 tpt = e1000_read32(mmio, E1000_REG_TPT);
-            uint32 rdh = e1000_read32(mmio, E1000_REG_RDH);
-            ioreq->ios2_SrcAddr[0] = (UBYTE)(tpt >> 24);
-            ioreq->ios2_SrcAddr[1] = (UBYTE)(tpt >> 16);
-            ioreq->ios2_SrcAddr[2] = (UBYTE)(tpt >> 8);
-            ioreq->ios2_SrcAddr[3] = (UBYTE)(tpt);
-            ioreq->ios2_SrcAddr[4] = (UBYTE)(rdh >> 24);
-            ioreq->ios2_SrcAddr[5] = (UBYTE)(rdh >> 16);
-            ioreq->ios2_SrcAddr[6] = (UBYTE)(rdh >> 8);
-            ioreq->ios2_SrcAddr[7] = (UBYTE)(rdh);
-
-            /* Scan RX descriptors for STATUS.DD set. Reset SrcAddr[0..3]
-             * ← wait we just used those for TPT. Use DstAddr for the DD
-             * scan instead. */
-            ULONG dd_count = 0;
-            ULONG first_len = 0;
-            if (devBase->rx_ring) {
-                volatile UBYTE *rr = (volatile UBYTE *)devBase->rx_ring;
-                for (int i = 0; i < VN_RING_ENTRIES; i++) {
-                    volatile UBYTE *rd = rr + (i * VN_DESC_SIZE);
-                    /* Legacy RX descriptor: bytes 8-9 = length (LE),
-                     * byte 12 = status (bit 0 = DD, done). */
-                    if (rd[12] & 0x01) {
-                        if (dd_count == 0) {
-                            first_len = ((ULONG)rd[9] << 8) | (ULONG)rd[8];
-                        }
-                        dd_count++;
-                    }
-                }
-            }
-            ioreq->ios2_DstAddr[0] = (UBYTE)(dd_count >> 24);
-            ioreq->ios2_DstAddr[1] = (UBYTE)(dd_count >> 16);
-            ioreq->ios2_DstAddr[2] = (UBYTE)(dd_count >> 8);
-            ioreq->ios2_DstAddr[3] = (UBYTE)(dd_count);
-            ioreq->ios2_DstAddr[4] = (UBYTE)(first_len >> 8);
-            ioreq->ios2_DstAddr[5] = (UBYTE)(first_len);
-            /* Phase 6l task-path diagnostics: */
-            ioreq->ios2_DstAddr[6]  = (UBYTE)(devBase->task_wake_count >> 8);
-            ioreq->ios2_DstAddr[7]  = (UBYTE)(devBase->task_wake_count);
-            ioreq->ios2_DstAddr[8]  = (UBYTE)(devBase->process_rx_dd_seen >> 8);
-            ioreq->ios2_DstAddr[9]  = (UBYTE)(devBase->process_rx_dd_seen);
-            ioreq->ios2_DstAddr[10] = (UBYTE)(devBase->process_rx_delivered >> 8);
-            ioreq->ios2_DstAddr[11] = (UBYTE)(devBase->process_rx_delivered);
+        /* Phase 10g: expose virtio queue state — we don't have bar0
+         * (I/O port device), so read used->idx directly from vring
+         * memory. */
+        if (devBase->state == VN_STATE_ONLINE && devBase->rx_vring) {
+            UWORD num = devBase->rx_vring_num;
+            UBYTE *used_bytes = ((UBYTE *)devBase->rx_vring) + VRING_USED_OFFSET(num);
+            struct vring_used_header *used = (struct vring_used_header *)used_bytes;
+            UWORD used_idx = vio_le16_get(&used->idx);
+            UWORD last_used = devBase->rx_last_used;
+            ULONG pending = (ULONG)(UWORD)(used_idx - last_used);
+            UBYTE *avail_bytes = ((UBYTE *)devBase->rx_vring) + VRING_AVAIL_OFFSET(num);
+            struct vring_avail_header *avail = (struct vring_avail_header *)avail_bytes;
+            UWORD avail_idx = vio_le16_get(&avail->idx);
+            ioreq->ios2_SrcAddr[0] = (UBYTE)(used_idx >> 8);
+            ioreq->ios2_SrcAddr[1] = (UBYTE)(used_idx);
+            ioreq->ios2_SrcAddr[2] = (UBYTE)(last_used >> 8);
+            ioreq->ios2_SrcAddr[3] = (UBYTE)(last_used);
+            ioreq->ios2_SrcAddr[4] = (UBYTE)(avail_idx >> 8);
+            ioreq->ios2_SrcAddr[5] = (UBYTE)(avail_idx);
+            ioreq->ios2_DstAddr[0] = (UBYTE)(pending >> 24);
+            ioreq->ios2_DstAddr[1] = (UBYTE)(pending >> 16);
+            ioreq->ios2_DstAddr[2] = (UBYTE)(pending >> 8);
+            ioreq->ios2_DstAddr[3] = (UBYTE)(pending);
         }
+        ioreq->ios2_DstAddr[6]  = (UBYTE)(devBase->task_wake_count >> 8);
+        ioreq->ios2_DstAddr[7]  = (UBYTE)(devBase->task_wake_count);
+        ioreq->ios2_DstAddr[8]  = (UBYTE)(devBase->process_rx_dd_seen >> 8);
+        ioreq->ios2_DstAddr[9]  = (UBYTE)(devBase->process_rx_dd_seen);
+        ioreq->ios2_DstAddr[10] = (UBYTE)(devBase->process_rx_delivered >> 8);
+        ioreq->ios2_DstAddr[11] = (UBYTE)(devBase->process_rx_delivered);
         /* Phase 8f: last_dispatched_cmd in DstAddr[12..13]. Non-zero
          * post-crash tells us what command was being processed when
          * the driver task died. */
@@ -2335,37 +2305,34 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
 
         ULONG total_bytes = VIRTIO_NET_HDR_LEN + eth_len;
 
-        /* Fill TX descriptor 0. Buffer phys addr resolved at Init. */
+        /* Fill TX descriptor 0. All ring fields are LE — use helpers. */
         struct vring_desc *tdesc = (struct vring_desc *)devBase->tx_vring;
-        tdesc[0].addr_lo = devBase->tx_scratch2_phys;
-        tdesc[0].addr_hi = 0;
-        tdesc[0].len     = total_bytes;
-        tdesc[0].flags   = 0;   /* device-read, single-buffer */
-        tdesc[0].next    = 0;
+        vio_le32_put(&tdesc[0].addr_lo, devBase->tx_scratch2_phys);
+        vio_le32_put(&tdesc[0].addr_hi, 0);
+        vio_le32_put(&tdesc[0].len, total_bytes);
+        vio_le16_put(&tdesc[0].flags, 0);
+        vio_le16_put(&tdesc[0].next, 0);
 
         /* Push descriptor 0 onto TX avail ring. */
         UWORD tx_num = devBase->tx_vring_num;
         UBYTE *tavail_bytes = ((UBYTE *)devBase->tx_vring) + VRING_AVAIL_OFFSET(tx_num);
         struct vring_avail_header *tavail = (struct vring_avail_header *)tavail_bytes;
-        UWORD *tavail_ring = (UWORD *)(tavail_bytes + 4);
-        tavail_ring[tavail->idx % tx_num] = 0;
+        uint16 *tavail_ring = (uint16 *)(tavail_bytes + 4);
+        uint16 cur_avail = vio_le16_get(&tavail->idx);
+        vio_le16_put(&tavail_ring[cur_avail % tx_num], 0);
         __asm__ volatile ("eieio; sync" : : : "memory");
-        tavail->idx++;
+        vio_le16_put(&tavail->idx, cur_avail + 1);
         __asm__ volatile ("eieio; sync" : : : "memory");
         virtio_notify_queue(devBase, VIRTIO_NET_Q_TX);
 
-        /* Poll TX used ring briefly. Device usually completes within
-         * a few reads for a single-buffer packet. If not, we still
-         * reply successfully (device will eventually process it),
-         * because virtio TX is asynchronous — the buffer is device-
-         * owned until we see it come back on used ring. */
+        /* Poll TX used ring briefly for completion. */
         UBYTE *tused_bytes = ((UBYTE *)devBase->tx_vring) + VRING_USED_OFFSET(tx_num);
         struct vring_used_header *tused = (struct vring_used_header *)tused_bytes;
-        UWORD want_idx = tavail->idx;
+        uint16 want_idx = cur_avail + 1;
         BOOL done = FALSE;
         for (int i = 0; i < 10000; i++) {
             __asm__ volatile ("eieio; sync" : : : "memory");
-            if (tused->idx == want_idx) { done = TRUE; break; }
+            if (vio_le16_get(&tused->idx) == want_idx) { done = TRUE; break; }
         }
         (void)done;
         /* Bookkeeping only — TX completion doesn't gate our reply. */

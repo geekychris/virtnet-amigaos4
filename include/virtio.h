@@ -177,6 +177,48 @@ struct virtio_net_hdr {
 #define VIRTIO_NET_S_LINK_UP         1
 #define VIRTIO_NET_S_ANNOUNCE        2
 
+/* ---------- Endianness helpers ----------
+ *
+ * Virtio 0.9.5 spec §2.4 says legacy virtio uses guest-native endian
+ * in virtqueue memory. In practice, QEMU's transitional virtio-net-pci
+ * treats it as LITTLE-ENDIAN regardless of guest endianness (an
+ * incompatibility with the spec that Linux/BSD drivers work around
+ * the same way we do here). Byte-swap every 16- and 32-bit field we
+ * read from or write to the virtqueue rings.
+ *
+ * Using inline byte-by-byte accessors instead of __builtin_bswap*
+ * because PPC 460EX has direct byte-reverse load/store insns but
+ * struct field access via -> can't easily invoke them. The compiler
+ * usually collapses these to lwbrx / sthbrx anyway. */
+
+static inline uint16 vio_le16_get(uint16 *p)
+{
+    volatile UBYTE *b = (volatile UBYTE *)p;
+    return ((uint16)b[0]) | ((uint16)b[1] << 8);
+}
+static inline void vio_le16_put(uint16 *p, uint16 val)
+{
+    volatile UBYTE *b = (volatile UBYTE *)p;
+    b[0] = (UBYTE)(val);
+    b[1] = (UBYTE)(val >> 8);
+}
+static inline uint32 vio_le32_get(uint32 *p)
+{
+    volatile UBYTE *b = (volatile UBYTE *)p;
+    return ((uint32)b[0])
+         | ((uint32)b[1] <<  8)
+         | ((uint32)b[2] << 16)
+         | ((uint32)b[3] << 24);
+}
+static inline void vio_le32_put(uint32 *p, uint32 val)
+{
+    volatile UBYTE *b = (volatile UBYTE *)p;
+    b[0] = (UBYTE)(val);
+    b[1] = (UBYTE)(val >>  8);
+    b[2] = (UBYTE)(val >> 16);
+    b[3] = (UBYTE)(val >> 24);
+}
+
 /* ---------- Prototypes (implemented in src/virtio.c) ---------- */
 
 struct VirtnetBase;   /* forward decl — real def in virtnet.h */
