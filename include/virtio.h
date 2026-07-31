@@ -191,32 +191,27 @@ struct virtio_net_hdr {
  * struct field access via -> can't easily invoke them. The compiler
  * usually collapses these to lwbrx / sthbrx anyway. */
 
+/* Phase 10j-6 THEORY REVISION: QEMU virtio-net-pci on sam460ex may
+ * actually treat the ring as guest-native (BE on PPC) for legacy
+ * transitional. Prior "rx_dd_seen=4 with garbage indices" may have
+ * been stale state, not conclusive evidence for LE. Switching helpers
+ * to BE (native) writes as a test — if QEMU now accepts our
+ * descriptor and pcap shows a frame, this was the misdiagnosis. */
 static inline uint16 vio_le16_get(uint16 *p)
 {
-    volatile UBYTE *b = (volatile UBYTE *)p;
-    return ((uint16)b[0]) | ((uint16)b[1] << 8);
+    return *(volatile uint16 *)p;   /* BE native read */
 }
 static inline void vio_le16_put(uint16 *p, uint16 val)
 {
-    volatile UBYTE *b = (volatile UBYTE *)p;
-    b[0] = (UBYTE)(val);
-    b[1] = (UBYTE)(val >> 8);
+    *(volatile uint16 *)p = val;    /* BE native write */
 }
 static inline uint32 vio_le32_get(uint32 *p)
 {
-    volatile UBYTE *b = (volatile UBYTE *)p;
-    return ((uint32)b[0])
-         | ((uint32)b[1] <<  8)
-         | ((uint32)b[2] << 16)
-         | ((uint32)b[3] << 24);
+    return *(volatile uint32 *)p;
 }
 static inline void vio_le32_put(uint32 *p, uint32 val)
 {
-    volatile UBYTE *b = (volatile UBYTE *)p;
-    b[0] = (UBYTE)(val);
-    b[1] = (UBYTE)(val >>  8);
-    b[2] = (UBYTE)(val >> 16);
-    b[3] = (UBYTE)(val >> 24);
+    *(volatile uint32 *)p = val;
 }
 
 /* ---------- Prototypes (implemented in src/virtio.c) ---------- */

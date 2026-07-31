@@ -1208,17 +1208,33 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * single buffer + descriptor 0, serialized by the SANA-II dispatch
      * layer. */
     {
+        /* PHASE 10j-5: Try MEMF_24BITDMA (< 16 MB physical) to test
+         * whether high-memory addresses are unreachable by QEMU's
+         * PCI DMA on sam460ex. If TX now sends bytes to pcap, the
+         * DMA window is the issue. */
         devBase->tx_scratch2 = iexec->AllocVecTags(VN_RX_BUFSIZE,
-            AVT_Type,              MEMF_SHARED,
+            AVT_Type,              MEMF_SHARED | MEMF_24BITDMA,
             AVT_Contiguous,        TRUE,
             AVT_PhysicalAlignment, TRUE,
             AVT_Alignment,         16,
             AVT_ClearWithValue,    0,
             TAG_END);
         if (!devBase->tx_scratch2) {
-            LOGF(log, (CONST_STRPTR)"virtio: tx_scratch2 alloc FAILED\n");
-            vn_log_close(iexec, &log);
-            return (struct Library *)devBase;
+            LOGF(log, (CONST_STRPTR)"virtio: tx_scratch2 alloc FAILED (MEMF_24BITDMA)\n");
+            /* Fall back to any memory */
+            devBase->tx_scratch2 = iexec->AllocVecTags(VN_RX_BUFSIZE,
+                AVT_Type,              MEMF_SHARED,
+                AVT_Contiguous,        TRUE,
+                AVT_PhysicalAlignment, TRUE,
+                AVT_Alignment,         16,
+                AVT_ClearWithValue,    0,
+                TAG_END);
+            if (!devBase->tx_scratch2) {
+                LOGF(log, (CONST_STRPTR)"virtio: tx_scratch2 alloc FAILED (fallback)\n");
+                vn_log_close(iexec, &log);
+                return (struct Library *)devBase;
+            }
+            LOGF(log, (CONST_STRPTR)"virtio tx_scratch2: fell back to any-memory alloc\n");
         }
         devBase->tx_scratch2_phys = vn_dma_phys(iexec, devBase->tx_scratch2,
                                                 VN_RX_BUFSIZE, DMA_ReadFromRAM);
@@ -2337,26 +2353,23 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
 
         ULONG total_bytes = VIRTIO_NET_HDR_LEN + eth_len;
 
-        /* Split into 2-descriptor chain per legacy virtio-net convention
-         * (some QEMU versions strictly require this even with
-         * VIRTIO_F_ANY_LAYOUT negotiated):
-         *   desc 0: virtio_net_hdr (10 bytes), flags=NEXT, next=1
-         *   desc 1: Ethernet frame,           flags=0,    next=0
-         * Buffer at tx_scratch2_phys holds hdr, buffer at
-         * tx_scratch2_phys+VIRTIO_NET_HDR_LEN holds the frame. */
+        /* Single-descriptor TX (with ANY_LAYOUT negotiated).
+         * Combines virtio_net_hdr + Ethernet frame in one buffer. */
         struct vring_desc *tdesc = (struct vring_desc *)devBase->tx_vring;
         vio_le32_put(&tdesc[0].addr_lo, devBase->tx_scratch2_phys);
         vio_le32_put(&tdesc[0].addr_hi, 0);
-        vio_le32_put(&tdesc[0].len, VIRTIO_NET_HDR_LEN);
-        vio_le16_put(&tdesc[0].flags, VRING_DESC_F_NEXT);
-        vio_le16_put(&tdesc[0].next, 1);
+        vio_le32_put(&tdesc[0].len, total_bytes);
+        vio_le16_put(&tdesc[0].flags, 0);   /* device-read, single */
+        vio_le16_put(&tdesc[0].next, 0);
 
-        vio_le32_put(&tdesc[1].addr_lo, devBase->tx_scratch2_phys + VIRTIO_NET_HDR_LEN);
-        vio_le32_put(&tdesc[1].addr_hi, 0);
-        vio_le32_put(&tdesc[1].len, eth_len);
-        vio_le16_put(&tdesc[1].flags, 0);
-        vio_le16_put(&tdesc[1].next, 0);
-        (void)total_bytes;   /* now split across two descriptors */
+        /* CRITICAL: flush CPU cache for tx_scratch2 + descriptor so
+         * QEMU's PCI DMA reads the freshly-written bytes from RAM,
+         * not stale zeros still cached from AllocVecTags ClearWithValue.
+         * On PPC 460EX, RAM isn't automatically snoopy for DMA masters.
+         * Without this, pcap shows all-zero packets even though the
+         * buffer memory has correct data when inspected later. */
+        IExec->CacheClearE((APTR)devBase->tx_scratch2, total_bytes, CACRF_ClearD);
+        IExec->CacheClearE((APTR)devBase->tx_vring, 16, CACRF_ClearD);
 
         /* Push descriptor 0 onto TX avail ring. */
         UWORD tx_num = devBase->tx_vring_num;
@@ -2368,6 +2381,8 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
         __asm__ volatile ("eieio; sync" : : : "memory");
         vio_le16_put(&tavail->idx, cur_avail + 1);
         __asm__ volatile ("eieio; sync" : : : "memory");
+        /* Flush avail ring changes to RAM before the doorbell. */
+        IExec->CacheClearE(tavail_bytes, 4 + 2 * tx_num, CACRF_ClearD);
         virtio_notify_queue(devBase, VIRTIO_NET_Q_TX);
 
         /* Poll TX used ring briefly for completion. */
