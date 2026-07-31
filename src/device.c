@@ -1212,29 +1212,21 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
          * whether high-memory addresses are unreachable by QEMU's
          * PCI DMA on sam460ex. If TX now sends bytes to pcap, the
          * DMA window is the issue. */
+        /* Phase 10j-11: allocate with AVT_Lock=TRUE to pin the physical
+         * mapping so it doesn't move under our feet between the
+         * GetDMAList call and later CPU writes. */
         devBase->tx_scratch2 = iexec->AllocVecTags(VN_RX_BUFSIZE,
-            AVT_Type,              MEMF_SHARED | MEMF_24BITDMA,
+            AVT_Type,              MEMF_SHARED,
             AVT_Contiguous,        TRUE,
             AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment,         16,
+            AVT_Alignment,         4096,   /* full page align */
+            AVT_Lock,              TRUE,   /* pin phys mapping */
             AVT_ClearWithValue,    0,
             TAG_END);
         if (!devBase->tx_scratch2) {
-            LOGF(log, (CONST_STRPTR)"virtio: tx_scratch2 alloc FAILED (MEMF_24BITDMA)\n");
-            /* Fall back to any memory */
-            devBase->tx_scratch2 = iexec->AllocVecTags(VN_RX_BUFSIZE,
-                AVT_Type,              MEMF_SHARED,
-                AVT_Contiguous,        TRUE,
-                AVT_PhysicalAlignment, TRUE,
-                AVT_Alignment,         16,
-                AVT_ClearWithValue,    0,
-                TAG_END);
-            if (!devBase->tx_scratch2) {
-                LOGF(log, (CONST_STRPTR)"virtio: tx_scratch2 alloc FAILED (fallback)\n");
-                vn_log_close(iexec, &log);
-                return (struct Library *)devBase;
-            }
-            LOGF(log, (CONST_STRPTR)"virtio tx_scratch2: fell back to any-memory alloc\n");
+            LOGF(log, (CONST_STRPTR)"virtio: tx_scratch2 alloc FAILED\n");
+            vn_log_close(iexec, &log);
+            return (struct Library *)devBase;
         }
         devBase->tx_scratch2_phys = vn_dma_phys(iexec, devBase->tx_scratch2,
                                                 VN_RX_BUFSIZE, DMA_ReadFromRAM);
