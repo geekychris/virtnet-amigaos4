@@ -4,3 +4,9 @@ build/
 *.device
 *.exe
 .DS_Store
+
+# IntelliJ
+.idea/
+
+# RE probe object files
+re/*.o

@@ -1091,15 +1091,21 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
          * tx_scratch2 (2 KB) fits after the ring layout, keeping both
          * in a single AllocVecTags block. */
         ULONG tx_bytes = VRING_TOTAL_BYTES(devBase->tx_vring_num) + 4096;
+        /* Phase 10j-14b: MEMF_KICK|MEMF_SHARED for rings. Pure MEMF_KICK
+         * failed at 10KB (limited resource on OS4 sam460ex). Combined
+         * flag asks the allocator for KICK-compatible memory but falls
+         * back to SHARED if the low-RAM pool is exhausted. rtl8139 uses
+         * pure MEMF_KICK for 2KB buffers only; for larger rings we need
+         * something the allocator can actually satisfy. */
         devBase->rx_vring = iexec->AllocVecTags(rx_bytes,
-            AVT_Type,              MEMF_SHARED,
+            AVT_Type,              MEMF_KICK | MEMF_SHARED,
             AVT_Contiguous,        TRUE,
             AVT_PhysicalAlignment, TRUE,
             AVT_Alignment,         4096,
             AVT_ClearWithValue,    0,
             TAG_END);
         devBase->tx_vring = iexec->AllocVecTags(tx_bytes,
-            AVT_Type,              MEMF_SHARED,
+            AVT_Type,              MEMF_KICK | MEMF_SHARED,
             AVT_Contiguous,        TRUE,
             AVT_PhysicalAlignment, TRUE,
             AVT_Alignment,         4096,
@@ -1158,8 +1164,10 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
     {
         ULONG num = devBase->rx_vring_num;
         ULONG pool_bytes = num * VN_RX_BUFSIZE;
+        /* Phase 10j-14b: MEMF_KICK|MEMF_SHARED. 512KB pool won't fit in
+         * MEMF_KICK-only region. */
         devBase->rx_bufs = iexec->AllocVecTags(pool_bytes,
-            AVT_Type,              MEMF_SHARED,
+            AVT_Type,              MEMF_KICK | MEMF_SHARED,
             AVT_Contiguous,        TRUE,
             AVT_PhysicalAlignment, TRUE,
             AVT_Alignment,         16,
@@ -1211,19 +1219,36 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * single buffer + descriptor 0, serialized by the SANA-II dispatch
      * layer. */
     {
-        /* Phase 10j-12: piggy-back tx_scratch2 on tx_vring's tail.
-         * tx_vring is 10246 bytes at 4KB alignment (~12288 alloc).
-         * Trailing 2 KB is same memory pool that QEMU DEMONSTRABLY
-         * reads correctly (it accesses our descriptors there). If
-         * this works, it proves separate MEMF_SHARED allocations
-         * land in different DMA-visibility pools. */
-        ULONG scratch_offset = VRING_TOTAL_BYTES(devBase->tx_vring_num);
-        scratch_offset = (scratch_offset + 31) & ~31UL;   /* 32B align */
-        devBase->tx_scratch2 = (APTR)((UBYTE *)devBase->tx_vring + scratch_offset);
-        devBase->tx_scratch2_phys = devBase->tx_vring_phys + scratch_offset;
-        LOGF(log, (CONST_STRPTR)"virtio tx_scratch2 (piggyback on tx_vring): cpu=%p phys=%08lx offset=%lu\n",
-             devBase->tx_scratch2, (ULONG)devBase->tx_scratch2_phys,
-             (ULONG)scratch_offset);
+        /* Phase 10j-14b: allocate tx_scratch2 as a SEPARATE 2KB block
+         * with pure MEMF_KICK — matches rtl8139's proven-working pattern
+         * for DMA-visible packet buffers. Small size fits comfortably in
+         * the MEMF_KICK region on OS4/sam460ex. */
+        devBase->tx_scratch2 = iexec->AllocVecTags((ULONG)2048,
+            AVT_Type,              MEMF_KICK,
+            AVT_Contiguous,        TRUE,
+            AVT_PhysicalAlignment, TRUE,
+            AVT_Alignment,         32,
+            AVT_ClearWithValue,    0,
+            TAG_END);
+        if (!devBase->tx_scratch2) {
+            LOGF(log, (CONST_STRPTR)"virtio: tx_scratch2 (MEMF_KICK) alloc FAILED\n");
+            vn_log_close(iexec, &log);
+            return (struct Library *)devBase;
+        }
+        devBase->tx_scratch2_phys = vn_dma_phys(iexec, devBase->tx_scratch2, 2048, DMA_ReadFromRAM);
+        LOGF(log, (CONST_STRPTR)"virtio tx_scratch2 (MEMF_KICK): cpu=%p phys=%08lx\n",
+             devBase->tx_scratch2, (ULONG)devBase->tx_scratch2_phys);
+
+        /* Verify with IMMU that CPU phys matches DMA phys. */
+        struct MMUIFace *IMMU = (struct MMUIFace *)iexec->GetInterface(
+            (struct Library *)((struct ExecBase *)iexec->Data.LibBase),
+            "mmu", 1, NULL);
+        if (IMMU) {
+            APTR cpu_phys_scratch = IMMU->GetPhysicalAddress(devBase->tx_scratch2);
+            LOGF(log, (CONST_STRPTR)"IMMU: tx_scratch2 cpu_phys=%p (dma_phys=%08lx)\n",
+                 cpu_phys_scratch, (ULONG)devBase->tx_scratch2_phys);
+            iexec->DropInterface((struct Interface *)IMMU);
+        }
     }
 
     /* -------- Phase 10e: install IRQ + flip DRIVER_OK ----------
@@ -1525,10 +1550,11 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
             IExec->ReleaseSemaphore(&devBase->opener_lock);
         }
 
-        if (devBase->tx_scratch) { IExec->FreeVec(devBase->tx_scratch); devBase->tx_scratch = NULL; }
-        if (devBase->rx_buffers) { IExec->FreeVec(devBase->rx_buffers); devBase->rx_buffers = NULL; }
-        if (devBase->tx_ring)    { IExec->FreeVec(devBase->tx_ring);    devBase->tx_ring    = NULL; }
-        if (devBase->rx_ring)    { IExec->FreeVec(devBase->rx_ring);    devBase->rx_ring    = NULL; }
+        if (devBase->tx_scratch)  { IExec->FreeVec(devBase->tx_scratch);  devBase->tx_scratch  = NULL; }
+        if (devBase->tx_scratch2) { IExec->FreeVec(devBase->tx_scratch2); devBase->tx_scratch2 = NULL; }
+        if (devBase->rx_buffers)  { IExec->FreeVec(devBase->rx_buffers);  devBase->rx_buffers  = NULL; }
+        if (devBase->tx_ring)     { IExec->FreeVec(devBase->tx_ring);     devBase->tx_ring     = NULL; }
+        if (devBase->rx_ring)     { IExec->FreeVec(devBase->rx_ring);     devBase->rx_ring     = NULL; }
         if (devBase->bar0) {
             devBase->pciDevice->FreeResourceRange(devBase->bar0);
             devBase->bar0 = NULL;
@@ -2340,20 +2366,13 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
 
         ULONG total_bytes = VIRTIO_NET_HDR_LEN + eth_len;
 
-        /* Phase 10j-9: use CachePreDMA — the OS4-blessed primitive for
-         * flushing CPU cache AND getting the PCI-bus phys addr in one
-         * atomic call. Returns PhysicalAddress with the mapping. Must
-         * pair with CachePostDMA after device finishes. Length is
-         * in-out — may be reduced if the mapping spans discontiguous
-         * physical pages. */
-        ULONG pre_len = total_bytes;
-        uint32 live_phys = (uint32)(ULONG)IExec->CachePreDMA(
-            (CONST_APTR)devBase->tx_scratch2, &pre_len, DMA_ReadFromRAM);
-        if (live_phys == 0 || pre_len < total_bytes) {
-            /* Fallback: use init-time phys and separate cache flush. */
-            IExec->CacheClearE((APTR)devBase->tx_scratch2, total_bytes, CACRF_ClearD);
-            live_phys = devBase->tx_scratch2_phys;
-        }
+        /* Phase 10j-14: rtl8139-style — just flush cache + use init-time
+         * phys addr. MEMF_KICK memory is DMA-coherent, so no CachePreDMA
+         * translation is needed. CacheClearE ensures the CPU write is
+         * visible to the device DMA. */
+        IExec->CacheClearE((APTR)devBase->tx_scratch2, total_bytes,
+                           CACRF_ClearD | CACRF_InvalidateD);
+        uint32 live_phys = devBase->tx_scratch2_phys;
 
         /* Single-descriptor TX (with ANY_LAYOUT negotiated). */
         struct vring_desc *tdesc = (struct vring_desc *)devBase->tx_vring;

@@ -39,7 +39,7 @@ print("  ok:", d["bytes"], "bytes in", d["elapsed"], "s, crc", crc)
 '
 }
 
-push_one "$HERE/build/virte1000.device.debug" "DH1:virte1000.device"
+push_one "$HERE/build/virtnet.device.debug" "DH1:virtnet.device"
 
 for t in "$@"; do
   bin="$HERE/build/$t"
