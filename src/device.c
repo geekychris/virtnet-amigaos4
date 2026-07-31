@@ -17,6 +17,7 @@
  */
 
 #include "virtnet.h"
+#include "virtio.h"
 #include "version.h"
 
 #include <exec/exectags.h>
@@ -970,277 +971,127 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
              (bar0raw & 8) ? (CONST_STRPTR)"yes" : (CONST_STRPTR)"no");
     }
 
-    /* -------- Phase 3d/e: hold BAR0 + read STATUS/CTRL ----------
-     * GetResourceRange resolves the raw config-space BAR to a CPU-visible
-     * address the driver can dereference. Hold it in devBase->bar0 across
-     * Init; Expunge frees it back. First MMIO reads use the byte-reversed
-     * lwbrx primitive so we can dereference LE registers without an
-     * explicit swap step. STATUS.LU tells us whether QEMU's virtual link
-     * is up (should be 1 with user-mode net) and STATUS.SPEED reports
-     * the negotiated link speed. Pure reads — safe. */
-    devBase->bar0 = devBase->pciDevice->GetResourceRange(0);
-    if (!devBase->bar0) {
-        LOGF(log, (CONST_STRPTR)"GetResourceRange(0): FAILED - BAR0 not mappable\n");
+    /* -------- Phase 10a: virtio BAR0 (I/O port) ----------
+     * Legacy virtio devices expose their control registers via an
+     * I/O port BAR (BAR0, bit0 set). We extract the port base by
+     * reading the raw BAR value and masking off the low 2 bits (I/O
+     * space indicator + reserved). Register accesses go through
+     * IPCI->InByte/OutByte etc. which handle the PPC → PCI I/O
+     * translation and the little-endian byte-swap for us. */
+    {
+        ULONG bar0raw = devBase->pciDevice->ReadConfigLong(PCI_BASE_ADDRESS_0);
+        if (!(bar0raw & 1)) {
+            LOGF(log, (CONST_STRPTR)"BAR0 is MEM not IO — virtio-modern-only device? aborting Init\n");
+            vn_log_close(iexec, &log);
+            return (struct Library *)devBase;
+        }
+        devBase->io_base = bar0raw & ~0x03UL;
+        LOGF(log, (CONST_STRPTR)"virtio: io_base=%08lx\n", (ULONG)devBase->io_base);
+    }
+
+    /* Ensure BUS_MASTER + IO_SPACE are enabled in PCI command. QEMU
+     * usually pre-sets these but be defensive — a cold reset may
+     * clear BUS_MASTER. */
+    {
+        UWORD cmd = devBase->pciDevice->ReadConfigWord(PCI_COMMAND);
+        UWORD want = cmd | 0x0005;   /* IO_SPACE=1 | BUS_MASTER=4 */
+        if (want != cmd) {
+            devBase->pciDevice->WriteConfigWord(PCI_COMMAND, want);
+            LOGF(log, (CONST_STRPTR)"pci cmd: %04lx -> %04lx (enabling IO+bus-master)\n",
+                 (ULONG)cmd, (ULONG)want);
+        }
+    }
+
+    /* -------- Phase 10b: virtio init handshake ----------
+     * Per virtio 0.9.5 §3.1.1: RESET → ACK → DRIVER → feature
+     * negotiate → FEATURES_OK → queue setup → DRIVER_OK. Here we
+     * do RESET+ACK+DRIVER + feature negotiate. Queue setup and
+     * DRIVER_OK are Phase 10c/d, coming next. */
+    if (!virtio_reset_and_ack(devBase)) {
+        LOGF(log, (CONST_STRPTR)"virtio: reset/ack FAILED — device signaled FAILED\n");
         vn_log_close(iexec, &log);
         return (struct Library *)devBase;
     }
-    LOGF(log, (CONST_STRPTR)"BAR0 held: cpu=%08lx phys=%08lx size=%lu\n",
-         (ULONG)devBase->bar0->BaseAddress, (ULONG)devBase->bar0->Physical,
-         (ULONG)devBase->bar0->Size);
+    LOGF(log, (CONST_STRPTR)"virtio: reset OK, status=%02lx\n",
+         (ULONG)virtio_read_status(devBase));
 
-    {
-        volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        uint32 ctrl   = e1000_read32(mmio, E1000_REG_CTRL);
-        uint32 status = e1000_read32(mmio, E1000_REG_STATUS);
-        ULONG speed_code = (status & E1000_STATUS_SPEED_MASK) >> E1000_STATUS_SPEED_SHIFT;
-        CONST_STRPTR speed_name = (CONST_STRPTR)
-            (speed_code == 0 ? "10Mb" :
-             speed_code == 1 ? "100Mb" :
-             speed_code == 2 ? "1000Mb" : "1000Mb-alt");
+    /* Negotiate ONLY the features we actually implement. Keep the
+     * subset minimal for the first cut:
+     *   - VIRTIO_NET_F_MAC   : device provides MAC via config space
+     *   - VIRTIO_NET_F_STATUS: device advertises link status
+     * Explicitly REJECT VIRTIO_NET_F_MRG_RXBUF (keeps the packet
+     * header at 10 bytes not 12) and all GSO / TSO / checksum-
+     * offload variants (we do plain copies, no HW offload support). */
+    ULONG want_feat = VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS;
+    virtio_negotiate_features(devBase, want_feat);
+    LOGF(log, (CONST_STRPTR)"virtio: device_features=%08lx driver_wants=%08lx accepted=%08lx\n",
+         (ULONG)devBase->device_features, (ULONG)want_feat,
+         (ULONG)devBase->driver_features);
 
-        LOGF(log, (CONST_STRPTR)"MMIO CTRL   = %08lx\n", (ULONG)ctrl);
-        LOGF(log, (CONST_STRPTR)"MMIO STATUS = %08lx  (link %s, %s duplex, speed %s)\n",
-             (ULONG)status,
-             (status & E1000_STATUS_LU) ? (CONST_STRPTR)"UP"   : (CONST_STRPTR)"down",
-             (status & E1000_STATUS_FD) ? (CONST_STRPTR)"full" : (CONST_STRPTR)"half",
-             speed_name);
-    }
+    /* Discover queue sizes. Legacy virtio-net has two mandatory
+     * queues: 0=RX, 1=TX. Queue 2 is CTRL_VQ, only present if we
+     * negotiated VIRTIO_NET_F_CTRL_VQ (we didn't, so skip). */
+    devBase->rx_vring_num = virtio_queue_num(devBase, VIRTIO_NET_Q_RX);
+    devBase->tx_vring_num = virtio_queue_num(devBase, VIRTIO_NET_Q_TX);
+    LOGF(log, (CONST_STRPTR)"virtio queues: RX num=%lu, TX num=%lu\n",
+         (ULONG)devBase->rx_vring_num, (ULONG)devBase->tx_vring_num);
 
-    /* -------- Phase 3f: read MAC from RAL/RAH ----------
-     * The 82540EM Receive Address Registers hold the primary MAC. RAL is
-     * the low 32 bits (bytes 0-3); RAH is 16 bits (bytes 4-5) plus a
-     * valid flag in bit 31. QEMU pre-fills these from the -device's
-     * mac= option; default is 52:54:00:12:34:56. */
-    {
-        volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        uint32 ral = e1000_read32(mmio, E1000_REG_RAL);
-        uint32 rah = e1000_read32(mmio, E1000_REG_RAH);
-        devBase->mac[0] = (UBYTE)(ral        & 0xff);
-        devBase->mac[1] = (UBYTE)((ral >> 8) & 0xff);
-        devBase->mac[2] = (UBYTE)((ral >> 16)& 0xff);
-        devBase->mac[3] = (UBYTE)((ral >> 24)& 0xff);
-        devBase->mac[4] = (UBYTE)(rah        & 0xff);
-        devBase->mac[5] = (UBYTE)((rah >> 8) & 0xff);
-        BOOL valid = (rah & (1U << 31)) != 0;
-        LOGF(log, (CONST_STRPTR)"MMIO RAL    = %08lx\n", (ULONG)ral);
-        LOGF(log, (CONST_STRPTR)"MMIO RAH    = %08lx  (valid=%s)\n",
-             (ULONG)rah, valid ? (CONST_STRPTR)"yes" : (CONST_STRPTR)"no");
+    /* -------- Phase 10c: read MAC from device config ----------
+     * With VIRTIO_NET_F_MAC negotiated, bytes 0..5 of the device-
+     * specific config region (offset 0x14 from BAR0 when no MSI-X)
+     * hold the primary MAC. QEMU pre-fills from the -device mac=
+     * option; default 52:54:00:12:34:5x. */
+    if (devBase->driver_features & VIRTIO_NET_F_MAC) {
+        for (int i = 0; i < 6; i++) {
+            devBase->mac[i] = virtio_read_dev_cfg8(devBase, i);
+        }
         LOGF(log, (CONST_STRPTR)"MAC         = %02lx:%02lx:%02lx:%02lx:%02lx:%02lx\n",
              (ULONG)devBase->mac[0], (ULONG)devBase->mac[1], (ULONG)devBase->mac[2],
              (ULONG)devBase->mac[3], (ULONG)devBase->mac[4], (ULONG)devBase->mac[5]);
-
-        /* All the acquire steps succeeded — flip the flag so BeginIO
-         * dispatch knows S2_DEVICEQUERY / S2_GETSTATIONADDRESS can
-         * answer with real values instead of S2ERR_OUTOFSERVICE. */
-        devBase->hw_present = TRUE;
+    } else {
+        LOGF(log, (CONST_STRPTR)"virtio: no MAC feature — device didn't provide MAC\n");
+        /* Fake a MAC so the driver doesn't crash on GETSTATIONADDRESS.
+         * Real fix: fail Init instead. */
+        for (int i = 0; i < 6; i++) devBase->mac[i] = 0;
+    }
+    /* Optional: read link status if VIRTIO_NET_F_STATUS negotiated.
+     * Status is 2 bytes at cfg offset 6. */
+    if (devBase->driver_features & VIRTIO_NET_F_STATUS) {
+        /* virtio-net status is 2 bytes at cfg offset 6. Device stores
+         * it little-endian, but IPCI->InWord on PPC returns the raw
+         * PCI-cycle byte order (no swap). Decode LE explicitly. */
+        UBYTE lo = virtio_read_dev_cfg8(devBase, 6);
+        UBYTE hi = virtio_read_dev_cfg8(devBase, 7);
+        UWORD link = ((UWORD)hi << 8) | lo;
+        LOGF(log, (CONST_STRPTR)"virtio link status: %04lx  (%s)\n",
+             (ULONG)link,
+             (link & VIRTIO_NET_S_LINK_UP) ? (CONST_STRPTR)"UP" : (CONST_STRPTR)"down");
     }
 
-    /* -------- Phase 4a: quiesce ----------
-     * Mask all interrupt sources and clear anything pending. Deliberately
-     * DON'T touch RCTL/TCTL yet — writing RCTL triggers QEMU's 1-second
-     * flush_queue_timer per DESIGN.md §3, so we do it once at ring-enable
-     * time only. Reads here just verify the post-reset state is idle
-     * (RCTL/TCTL/IMS all zero, ICR whatever) so we know Phase 4c-f start
-     * from a known-good baseline. */
-    {
-        volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
+    /* All the acquire steps succeeded — flip the flag so BeginIO
+     * dispatch knows S2_DEVICEQUERY / S2_GETSTATIONADDRESS can
+     * answer with real values instead of S2ERR_OUTOFSERVICE. */
+    devBase->hw_present = TRUE;
 
-        /* IMC is write-1-to-mask; 0xFFFFFFFF masks every cause. */
-        e1000_write32(mmio, E1000_REG_IMC, 0xFFFFFFFFUL);
-
-        /* ICR is read-to-clear on this device (per QEMU set_interrupt_cause
-         * and DESIGN.md §6). Reading it drops all pending causes. */
-        uint32 icr_at_reset = e1000_read32(mmio, E1000_REG_ICR);
-
-        /* Now read back the state we expect to be idle. */
-        uint32 ims  = e1000_read32(mmio, E1000_REG_IMS);
-        uint32 rctl = e1000_read32(mmio, E1000_REG_RCTL);
-        uint32 tctl = e1000_read32(mmio, E1000_REG_TCTL);
-
-        LOGF(log, (CONST_STRPTR)"quiesce: ICR-at-reset=%08lx IMS=%08lx RCTL=%08lx TCTL=%08lx\n",
-             (ULONG)icr_at_reset, (ULONG)ims, (ULONG)rctl, (ULONG)tctl);
-
-        if (ims != 0 || rctl != 0 || tctl != 0) {
-            /* Not fatal — but log loudly. Something else has touched this
-             * NIC (unlikely in a fresh QEMU boot, but possible if a prior
-             * driver Init run left state around). */
-            LOGF(log, (CONST_STRPTR)"quiesce: WARNING - one of IMS/RCTL/TCTL "
-                 "was non-zero at Init; device may not be in cold state\n");
-        }
-    }
-
-    /* -------- Phase 4b: allocate DMA rings + RX buffer pool ----------
-     * MEMF_SHARED = usable by DMA masters (including PCI bus). Contiguous
-     * + PhysicalAlignment + Alignment=16 satisfies the 82540EM's ring
-     * alignment requirement. Buffers: 16 × 2KB, one per RX descriptor.
-     * If any alloc fails we log, leave hw_present TRUE (basic Init worked)
-     * but skip ring programming — later phases refuse to enable RX/TX. */
-    {
-        ULONG ring_bytes = VN_RING_ENTRIES * VN_DESC_SIZE;
-        ULONG buf_bytes  = VN_RING_ENTRIES * VN_RX_BUFSIZE;
-
-        devBase->rx_ring = iexec->AllocVecTags(ring_bytes,
-            AVT_Type, MEMF_SHARED,
-            AVT_Contiguous, TRUE,
-            AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment, 16,
-            AVT_ClearWithValue, 0,
-            TAG_END);
-        devBase->tx_ring = iexec->AllocVecTags(ring_bytes,
-            AVT_Type, MEMF_SHARED,
-            AVT_Contiguous, TRUE,
-            AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment, 16,
-            AVT_ClearWithValue, 0,
-            TAG_END);
-        devBase->rx_buffers = iexec->AllocVecTags(buf_bytes,
-            AVT_Type, MEMF_SHARED,
-            AVT_Contiguous, TRUE,
-            AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment, 16,
-            AVT_ClearWithValue, 0,
-            TAG_END);
-
-        LOGF(log, (CONST_STRPTR)"rings: rx_ring=%p tx_ring=%p rx_buffers=%p (each %lu, buf pool %lu)\n",
-             devBase->rx_ring, devBase->tx_ring, devBase->rx_buffers,
-             (ULONG)ring_bytes, (ULONG)buf_bytes);
-
-        if (!devBase->rx_ring || !devBase->tx_ring || !devBase->rx_buffers) {
-            LOGF(log, (CONST_STRPTR)"rings: ALLOC FAILED - device will not be enabled\n");
-        }
-
-        /* Resolve CPU-virtual ring addresses to PCI-bus physical
-         * addresses via StartDMA + GetDMAList. These physical values
-         * are what we write to RDBAL/TDBAL and per-descriptor
-         * buffer_addr fields. On sam460ex they often match the CPU
-         * virt (identity mapping) but we can't rely on that — the
-         * pa6t_eth reference driver does this per-allocation. */
-        if (devBase->rx_ring) {
-            devBase->rx_ring_phys = vn_dma_phys(iexec, devBase->rx_ring,
-                                                    ring_bytes, 0);
-        }
-        if (devBase->tx_ring) {
-            devBase->tx_ring_phys = vn_dma_phys(iexec, devBase->tx_ring,
-                                                    ring_bytes, DMA_ReadFromRAM);
-        }
-        if (devBase->rx_buffers) {
-            devBase->rx_buffers_phys = vn_dma_phys(iexec, devBase->rx_buffers,
-                                                       buf_bytes, 0);
-        }
-        LOGF(log, (CONST_STRPTR)"rings phys: rx_ring=%08lx tx_ring=%08lx rx_buffers=%08lx\n",
-             (ULONG)devBase->rx_ring_phys, (ULONG)devBase->tx_ring_phys,
-             (ULONG)devBase->rx_buffers_phys);
-
-        /* Dedicated TX scratch — separate from rx_buffers so HW's
-         * TX-read DMA doesn't race with RX-write DMA at the same phys
-         * address. 2 KB is enough for one full-size Ethernet frame. */
-        devBase->tx_scratch = iexec->AllocVecTags(VN_RX_BUFSIZE,
-            AVT_Type,           MEMF_SHARED,
-            AVT_Contiguous,     TRUE,
-            AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment,      16,
-            AVT_ClearWithValue, 0,
-            TAG_END);
-        if (devBase->tx_scratch) {
-            devBase->tx_scratch_phys = vn_dma_phys(iexec, devBase->tx_scratch,
-                                                      VN_RX_BUFSIZE, DMA_ReadFromRAM);
-        }
-        LOGF(log, (CONST_STRPTR)"tx_scratch: cpu=%p phys=%08lx\n",
-             devBase->tx_scratch, (ULONG)devBase->tx_scratch_phys);
-    }
-
-    /* -------- Phase 4c: populate RX descriptors + program RX ring regs ----
-     * Legacy 16-byte RX descriptor layout, little-endian:
-     *   [0..7]  buffer_addr (64-bit)
-     *   [8..9]  length       (HW writes on RX)
-     *   [10..11] csum        (HW writes)
-     *   [12]    status       (HW writes; bit0 = DD, done)
-     *   [13]    errors
-     *   [14..15] special
-     * For "empty, ready to receive": buffer_addr = per-descriptor slice
-     * of rx_buffers, everything else zero. RX is NOT enabled here — that's
-     * Phase 4e. We only want to verify the register writes take. */
-    if (devBase->rx_ring && devBase->rx_buffers && devBase->rx_buffers_phys) {
-        volatile UBYTE *desc = (volatile UBYTE *)devBase->rx_ring;
-        ULONG buf_lo = devBase->rx_buffers_phys;   /* PCI-bus phys */
-        for (int i = 0; i < VN_RING_ENTRIES; i++) {
-            volatile UBYTE *d = desc + (i * VN_DESC_SIZE);
-            poke_le32(d + 0, buf_lo + (i * VN_RX_BUFSIZE));  /* addr low  */
-            poke_le32(d + 4, 0);                                 /* addr high */
-            poke_le32(d + 8, 0);                                 /* len+csum  */
-            poke_le32(d + 12, 0);                                /* status/err/special */
-        }
-        vn_wmb();
-
-        volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        e1000_write32(mmio, E1000_REG_RDBAL, devBase->rx_ring_phys);
-        e1000_write32(mmio, E1000_REG_RDBAH, 0);
-        e1000_write32(mmio, E1000_REG_RDLEN, VN_RING_ENTRIES * VN_DESC_SIZE);
-        e1000_write32(mmio, E1000_REG_RDH,   0);
-        e1000_write32(mmio, E1000_REG_RDT,   VN_RING_ENTRIES - 1);
-
-        /* Read back to verify — writes to reserved bits get dropped, so
-         * a mismatch would flag a wrong offset or a QEMU quirk. */
-        LOGF(log, (CONST_STRPTR)"RX ring: RDBAL=%08lx RDBAH=%08lx RDLEN=%lu RDH=%lu RDT=%lu\n",
-             (ULONG)e1000_read32(mmio, E1000_REG_RDBAL),
-             (ULONG)e1000_read32(mmio, E1000_REG_RDBAH),
-             (ULONG)e1000_read32(mmio, E1000_REG_RDLEN),
-             (ULONG)e1000_read32(mmio, E1000_REG_RDH),
-             (ULONG)e1000_read32(mmio, E1000_REG_RDT));
-    }
-
-    /* -------- Phase 4d: program TX ring regs ----------
-     * TX descriptors get filled at CMD_WRITE time, not at Init — so leave
-     * the ring memory as-is (zeros). Just program the base/length so the
-     * NIC knows where to look, and set HEAD=TAIL=0 for "no work queued".
-     * TX still disabled (TCTL.EN=0). */
-    if (devBase->tx_ring && devBase->tx_ring_phys) {
-        volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
-        e1000_write32(mmio, E1000_REG_TDBAL, devBase->tx_ring_phys);
-        e1000_write32(mmio, E1000_REG_TDBAH, 0);
-        e1000_write32(mmio, E1000_REG_TDLEN, VN_RING_ENTRIES * VN_DESC_SIZE);
-        e1000_write32(mmio, E1000_REG_TDH,   0);
-        e1000_write32(mmio, E1000_REG_TDT,   0);
-
-        LOGF(log, (CONST_STRPTR)"TX ring: TDBAL=%08lx TDBAH=%08lx TDLEN=%lu TDH=%lu TDT=%lu\n",
-             (ULONG)e1000_read32(mmio, E1000_REG_TDBAL),
-             (ULONG)e1000_read32(mmio, E1000_REG_TDBAH),
-             (ULONG)e1000_read32(mmio, E1000_REG_TDLEN),
-             (ULONG)e1000_read32(mmio, E1000_REG_TDH),
-             (ULONG)e1000_read32(mmio, E1000_REG_TDT));
-    }
-
-    /* Phase 4e/f (RX/TX enable) + Phase 5c/d (IMS unmask) moved to
-     * vn_online() and only run when S2_ONLINE fires. Init leaves us
-     * with rings programmed but the device idle — that's the SANA-II
-     * spec's OFFLINE state.
+    /* Phase 10c stub: virtqueue setup + IRQ install are DEFERRED to
+     * Phase 10d (next iteration). For now, Init stops here with the
+     * device negotiated but not usable — that's enough to verify the
+     * legacy PCI transport works end-to-end and the SANA-II layer
+     * can still respond to DBG/DEVICEQUERY commands.
      *
-     * -------- Phase 5a+b: map + install IRQ handler ----------
-     * MapInterrupt resolves config-space InterruptLine to a system vector.
-     * Then AddIntServer chains us on the shared PCI INTx server list.
-     * IMS still 0 (all sources masked) — Phase 5c unmasks LSC below. */
-    if (devBase->pciDevice) {
-        devBase->irq_vector = devBase->pciDevice->MapInterrupt();
-        LOGF(log, (CONST_STRPTR)"MapInterrupt: vector=%lu\n", devBase->irq_vector);
-
-        if (devBase->irq_vector != 0) {
-            devBase->irq_node.is_Node.ln_Type = NT_INTERRUPT;
-            devBase->irq_node.is_Node.ln_Pri  = 0;
-            devBase->irq_node.is_Node.ln_Name = (STRPTR)DEVNAME;
-            devBase->irq_node.is_Data         = (APTR)devBase;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wcast-function-type"
-            devBase->irq_node.is_Code = (VOID (*)())vn_isr;
-#pragma GCC diagnostic pop
-
-            BOOL ok = iexec->AddIntServer(devBase->irq_vector, &devBase->irq_node);
-            devBase->irq_installed = ok;
-            LOGF(log, (CONST_STRPTR)"AddIntServer: vec=%lu result=%s\n",
-                 devBase->irq_vector, ok ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED");
-        } else {
-            LOGF(log, (CONST_STRPTR)"MapInterrupt returned 0 — no IRQ hooked\n");
-        }
-    }
+     * TODO Phase 10d:
+     *   - Allocate rx_vring / tx_vring per VRING_TOTAL_BYTES(num),
+     *     page-aligned via AVT_PhysicalAlignment + AVT_Alignment=4096
+     *   - virtio_set_queue_pfn for each queue
+     *   - Populate RX avail ring with empty buffers so device has
+     *     somewhere to write incoming frames
+     *   - MapInterrupt + AddIntServer with vn_isr (still reads ISR
+     *     bit 0 for used-idx advancement — identical high-level flow
+     *     to e1000)
+     *   - virtio_driver_ok(base) to flip STATUS.DRIVER_OK
+     *   - Wire TX/RX bottom halves in dispatch to talk queues
+     */
+    LOGF(log, (CONST_STRPTR)"virtio init: STOPPING AT PHASE 10c — queues + IRQ not yet wired\n");
 
     /* Phase 6k/l: unit task processes queued CMD_READ on ISR signal.
      * PHASE 7q: task ALSO creates its own begin_port + waits on it —

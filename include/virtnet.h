@@ -35,11 +35,39 @@ struct VirtnetBase
     BPTR               dev_SegList;
     struct SignalSemaphore io_lock;
 
-    /* PCI plumbing — populated by Init if e1000 present, else NULL. */
+    /* PCI plumbing — populated by Init if virtio-net present, else NULL. */
     struct Library         *ExpansionBase;
     struct PCIIFace        *IPCI;
     struct PCIDevice       *pciDevice;
-    struct PCIResourceRange *bar0;   /* MMIO range for e1000 register file */
+    struct PCIResourceRange *bar0;   /* legacy: I/O port range; modern: MMIO */
+
+    /* Phase 10: virtio legacy PCI transport state. io_base is the
+     * PCI I/O port base extracted from BAR0 (masked to clear the
+     * I/O-space bit). Register accesses = IPCI->OutByte(dev, io_base
+     * + REG_OFFSET, val) etc. */
+    ULONG              io_base;
+    ULONG              device_features;   /* what device offered */
+    ULONG              driver_features;   /* what we accepted */
+
+    /* Virtqueue backing store — one contiguous alloc per queue.
+     * Layout per virtio 0.9.5 §2.4.2: desc[num] + avail + PAD +
+     * used. VRING_TOTAL_BYTES(num) sized. Physical address (page
+     * frame number) written to VIRTIO_PCI_QUEUE_PFN. */
+    APTR               rx_vring;
+    ULONG              rx_vring_phys;
+    UWORD              rx_vring_num;      /* queue size (from QUEUE_NUM) */
+    UWORD              rx_next_avail;     /* next slot in avail ring driver-owned */
+    UWORD              rx_last_used;      /* our high-water on used ring */
+    APTR               rx_bufs;           /* pool of RX packet buffers */
+    ULONG              rx_bufs_phys;
+
+    APTR               tx_vring;
+    ULONG              tx_vring_phys;
+    UWORD              tx_vring_num;
+    UWORD              tx_next_avail;
+    UWORD              tx_last_used;
+    APTR               tx_scratch2;       /* single TX bounce buffer (phase 10 stub) */
+    ULONG              tx_scratch2_phys;
 
     /* Cached hardware state — read once at Init from RAL/RAH. Serves
      * S2_GETSTATIONADDRESS + S2_DEVICEQUERY without re-hitting MMIO on

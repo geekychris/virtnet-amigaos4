@@ -44,9 +44,10 @@ DEV_DBG  = $(BUILD)/virtnet.device.debug
 TEST_NAMES = testopen testdeviceq testmac testirq testonline testtx testrx testtx_cooked testrx_cooked testrxtask testroadshow testdiag testsizeof testdqbuf testcfgbuf testbsdadd testquery teststat
 TESTS      = $(patsubst %,$(BUILD)/%,$(TEST_NAMES))
 
-DEV_SRC  = src/device.c
-DEV_OBJ  = $(BUILD)/device.o
-DEV_OBJ_DBG = $(BUILD)/device.dbg.o
+DEV_SRC  = src/device.c src/virtio.c
+DEV_OBJ  = $(BUILD)/device.o $(BUILD)/virtio.o
+DEV_OBJ_DBG = $(BUILD)/device.dbg.o $(BUILD)/virtio.dbg.o
+DEV_HDRS = include/version.h include/virtnet.h include/virtio.h
 
 .PHONY: all clean test help
 
@@ -55,10 +56,10 @@ all: $(DEV) $(DEV_DBG) $(TESTS)
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(DEV_OBJ): $(DEV_SRC) include/version.h include/virtnet.h | $(BUILD)
+$(BUILD)/%.o: src/%.c $(DEV_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(DEV_OBJ_DBG): $(DEV_SRC) include/version.h include/virtnet.h | $(BUILD)
+$(BUILD)/%.dbg.o: src/%.c $(DEV_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -DDEBUG -g -c $< -o $@
 
 # Release device: stripped, ready for SYS:Kickstart/ (once stable).
