@@ -1087,7 +1087,10 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
 
     {
         ULONG rx_bytes = VRING_TOTAL_BYTES(devBase->rx_vring_num);
-        ULONG tx_bytes = VRING_TOTAL_BYTES(devBase->tx_vring_num);
+        /* Phase 10j-12: over-allocate tx_vring so a piggy-backed
+         * tx_scratch2 (2 KB) fits after the ring layout, keeping both
+         * in a single AllocVecTags block. */
+        ULONG tx_bytes = VRING_TOTAL_BYTES(devBase->tx_vring_num) + 4096;
         devBase->rx_vring = iexec->AllocVecTags(rx_bytes,
             AVT_Type,              MEMF_SHARED,
             AVT_Contiguous,        TRUE,
@@ -1208,31 +1211,19 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * single buffer + descriptor 0, serialized by the SANA-II dispatch
      * layer. */
     {
-        /* PHASE 10j-5: Try MEMF_24BITDMA (< 16 MB physical) to test
-         * whether high-memory addresses are unreachable by QEMU's
-         * PCI DMA on sam460ex. If TX now sends bytes to pcap, the
-         * DMA window is the issue. */
-        /* Phase 10j-11: allocate with AVT_Lock=TRUE to pin the physical
-         * mapping so it doesn't move under our feet between the
-         * GetDMAList call and later CPU writes. */
-        devBase->tx_scratch2 = iexec->AllocVecTags(VN_RX_BUFSIZE,
-            AVT_Type,              MEMF_SHARED,
-            AVT_Contiguous,        TRUE,
-            AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment,         4096,   /* full page align */
-            AVT_Lock,              TRUE,   /* pin phys mapping */
-            AVT_ClearWithValue,    0,
-            TAG_END);
-        if (!devBase->tx_scratch2) {
-            LOGF(log, (CONST_STRPTR)"virtio: tx_scratch2 alloc FAILED\n");
-            vn_log_close(iexec, &log);
-            return (struct Library *)devBase;
-        }
-        devBase->tx_scratch2_phys = vn_dma_phys(iexec, devBase->tx_scratch2,
-                                                VN_RX_BUFSIZE, DMA_ReadFromRAM);
-        LOGF(log, (CONST_STRPTR)"virtio tx_scratch2: cpu=%p phys=%08lx (%lu bytes)\n",
+        /* Phase 10j-12: piggy-back tx_scratch2 on tx_vring's tail.
+         * tx_vring is 10246 bytes at 4KB alignment (~12288 alloc).
+         * Trailing 2 KB is same memory pool that QEMU DEMONSTRABLY
+         * reads correctly (it accesses our descriptors there). If
+         * this works, it proves separate MEMF_SHARED allocations
+         * land in different DMA-visibility pools. */
+        ULONG scratch_offset = VRING_TOTAL_BYTES(devBase->tx_vring_num);
+        scratch_offset = (scratch_offset + 31) & ~31UL;   /* 32B align */
+        devBase->tx_scratch2 = (APTR)((UBYTE *)devBase->tx_vring + scratch_offset);
+        devBase->tx_scratch2_phys = devBase->tx_vring_phys + scratch_offset;
+        LOGF(log, (CONST_STRPTR)"virtio tx_scratch2 (piggyback on tx_vring): cpu=%p phys=%08lx offset=%lu\n",
              devBase->tx_scratch2, (ULONG)devBase->tx_scratch2_phys,
-             (ULONG)VN_RX_BUFSIZE);
+             (ULONG)scratch_offset);
     }
 
     /* -------- Phase 10e: install IRQ + flip DRIVER_OK ----------
