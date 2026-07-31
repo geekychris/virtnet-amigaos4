@@ -1010,7 +1010,14 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * Explicitly REJECT VIRTIO_NET_F_MRG_RXBUF (keeps the packet
      * header at 10 bytes not 12) and all GSO / TSO / checksum-
      * offload variants (we do plain copies, no HW offload support). */
-    ULONG want_feat = VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS;
+    /* Also request VIRTIO_F_ANY_LAYOUT — this tells the device we
+     * can pack the virtio_net_hdr and the Ethernet frame into a
+     * SINGLE descriptor (as we do). Without it, TX must be a 2-
+     * descriptor chain (header + frame linked via NEXT flag) and
+     * QEMU rejects a single-descriptor TX with "bogus descriptor
+     * or out of resources". */
+    ULONG want_feat = VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS
+                    | VIRTIO_F_ANY_LAYOUT;
     virtio_negotiate_features(devBase, want_feat);
     LOGF(log, (CONST_STRPTR)"virtio: device_features=%08lx driver_wants=%08lx accepted=%08lx\n",
          (ULONG)devBase->device_features, (ULONG)want_feat,
@@ -1110,7 +1117,26 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         }
 
         virtio_set_queue_pfn(devBase, VIRTIO_NET_Q_RX, devBase->rx_vring_phys);
+        /* Readback: what did QEMU actually store? PFN is stored per
+         * currently-selected queue. After the set, QUEUE_SEL is still
+         * VIRTIO_NET_Q_RX so QUEUE_PFN reads the RX PFN back. */
+        {
+            ULONG rx_pfn_read = devBase->pciDevice->InLong(
+                devBase->io_base + VIRTIO_PCI_QUEUE_PFN);
+            ULONG expected = devBase->rx_vring_phys / VRING_ALIGN;
+            LOGF(log, (CONST_STRPTR)"virtio RX PFN: wrote=%08lx readback=%08lx %s\n",
+                 (ULONG)expected, (ULONG)rx_pfn_read,
+                 (expected == rx_pfn_read) ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"MISMATCH");
+        }
         virtio_set_queue_pfn(devBase, VIRTIO_NET_Q_TX, devBase->tx_vring_phys);
+        {
+            ULONG tx_pfn_read = devBase->pciDevice->InLong(
+                devBase->io_base + VIRTIO_PCI_QUEUE_PFN);
+            ULONG expected = devBase->tx_vring_phys / VRING_ALIGN;
+            LOGF(log, (CONST_STRPTR)"virtio TX PFN: wrote=%08lx readback=%08lx %s\n",
+                 (ULONG)expected, (ULONG)tx_pfn_read,
+                 (expected == tx_pfn_read) ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"MISMATCH");
+        }
     }
 
     /* -------- Phase 10d: allocate RX buffer pool + populate avail ring ----
@@ -2305,13 +2331,26 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
 
         ULONG total_bytes = VIRTIO_NET_HDR_LEN + eth_len;
 
-        /* Fill TX descriptor 0. All ring fields are LE — use helpers. */
+        /* Split into 2-descriptor chain per legacy virtio-net convention
+         * (some QEMU versions strictly require this even with
+         * VIRTIO_F_ANY_LAYOUT negotiated):
+         *   desc 0: virtio_net_hdr (10 bytes), flags=NEXT, next=1
+         *   desc 1: Ethernet frame,           flags=0,    next=0
+         * Buffer at tx_scratch2_phys holds hdr, buffer at
+         * tx_scratch2_phys+VIRTIO_NET_HDR_LEN holds the frame. */
         struct vring_desc *tdesc = (struct vring_desc *)devBase->tx_vring;
         vio_le32_put(&tdesc[0].addr_lo, devBase->tx_scratch2_phys);
         vio_le32_put(&tdesc[0].addr_hi, 0);
-        vio_le32_put(&tdesc[0].len, total_bytes);
-        vio_le16_put(&tdesc[0].flags, 0);
-        vio_le16_put(&tdesc[0].next, 0);
+        vio_le32_put(&tdesc[0].len, VIRTIO_NET_HDR_LEN);
+        vio_le16_put(&tdesc[0].flags, VRING_DESC_F_NEXT);
+        vio_le16_put(&tdesc[0].next, 1);
+
+        vio_le32_put(&tdesc[1].addr_lo, devBase->tx_scratch2_phys + VIRTIO_NET_HDR_LEN);
+        vio_le32_put(&tdesc[1].addr_hi, 0);
+        vio_le32_put(&tdesc[1].len, eth_len);
+        vio_le16_put(&tdesc[1].flags, 0);
+        vio_le16_put(&tdesc[1].next, 0);
+        (void)total_bytes;   /* now split across two descriptors */
 
         /* Push descriptor 0 onto TX avail ring. */
         UWORD tx_num = devBase->tx_vring_num;
