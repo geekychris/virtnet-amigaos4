@@ -2311,6 +2311,10 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
 
         UBYTE *dst = (UBYTE *)devBase->tx_scratch2;
 
+        /* Phase 10j-10 MARKER TEST: write a distinctive byte pattern
+         * so we can tell in pcap whether ANY of our data reaches QEMU. */
+        for (int i = 0; i < 128; i++) dst[i] = (UBYTE)(0xAA ^ (i & 0xFF));
+
         /* Zero virtio_net_hdr[0..9]. */
         for (int i = 0; i < VIRTIO_NET_HDR_LEN; i++) dst[i] = 0;
 
@@ -2353,23 +2357,37 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
 
         ULONG total_bytes = VIRTIO_NET_HDR_LEN + eth_len;
 
-        /* Single-descriptor TX (with ANY_LAYOUT negotiated).
-         * Combines virtio_net_hdr + Ethernet frame in one buffer. */
+        /* Phase 10j-9: use CachePreDMA — the OS4-blessed primitive for
+         * flushing CPU cache AND getting the PCI-bus phys addr in one
+         * atomic call. Returns PhysicalAddress with the mapping. Must
+         * pair with CachePostDMA after device finishes. Length is
+         * in-out — may be reduced if the mapping spans discontiguous
+         * physical pages. */
+        ULONG pre_len = total_bytes;
+        uint32 live_phys = (uint32)(ULONG)IExec->CachePreDMA(
+            (CONST_APTR)devBase->tx_scratch2, &pre_len, DMA_ReadFromRAM);
+        if (live_phys == 0 || pre_len < total_bytes) {
+            /* Fallback: use init-time phys and separate cache flush. */
+            IExec->CacheClearE((APTR)devBase->tx_scratch2, total_bytes, CACRF_ClearD);
+            live_phys = devBase->tx_scratch2_phys;
+        }
+
+        /* Single-descriptor TX (with ANY_LAYOUT negotiated). */
         struct vring_desc *tdesc = (struct vring_desc *)devBase->tx_vring;
-        vio_le32_put(&tdesc[0].addr_lo, devBase->tx_scratch2_phys);
+        vio_le32_put(&tdesc[0].addr_lo, live_phys);
         vio_le32_put(&tdesc[0].addr_hi, 0);
         vio_le32_put(&tdesc[0].len, total_bytes);
-        vio_le16_put(&tdesc[0].flags, 0);   /* device-read, single */
+        vio_le16_put(&tdesc[0].flags, 0);
         vio_le16_put(&tdesc[0].next, 0);
 
-        /* CRITICAL: flush CPU cache for tx_scratch2 + descriptor so
-         * QEMU's PCI DMA reads the freshly-written bytes from RAM,
-         * not stale zeros still cached from AllocVecTags ClearWithValue.
-         * On PPC 460EX, RAM isn't automatically snoopy for DMA masters.
-         * Without this, pcap shows all-zero packets even though the
-         * buffer memory has correct data when inspected later. */
-        IExec->CacheClearE((APTR)devBase->tx_scratch2, total_bytes, CACRF_ClearD);
+        /* Flush descriptor RAM too so QEMU DMA-reads it fresh. */
         IExec->CacheClearE((APTR)devBase->tx_vring, 16, CACRF_ClearD);
+        __asm__ volatile ("sync" : : : "memory");
+
+        /* Save diagnostics. */
+        devBase->last_copy_to_ptr = (APTR)(ULONG)live_phys;
+        devBase->last_copy_to_tag = (ULONG)total_bytes;
+        devBase->last_copy_to_size = (ULONG)eth_len;
 
         /* Push descriptor 0 onto TX avail ring. */
         UWORD tx_num = devBase->tx_vring_num;
