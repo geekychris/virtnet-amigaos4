@@ -1076,25 +1076,142 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * answer with real values instead of S2ERR_OUTOFSERVICE. */
     devBase->hw_present = TRUE;
 
-    /* Phase 10c stub: virtqueue setup + IRQ install are DEFERRED to
-     * Phase 10d (next iteration). For now, Init stops here with the
-     * device negotiated but not usable — that's enough to verify the
-     * legacy PCI transport works end-to-end and the SANA-II layer
-     * can still respond to DBG/DEVICEQUERY commands.
-     *
-     * TODO Phase 10d:
-     *   - Allocate rx_vring / tx_vring per VRING_TOTAL_BYTES(num),
-     *     page-aligned via AVT_PhysicalAlignment + AVT_Alignment=4096
-     *   - virtio_set_queue_pfn for each queue
-     *   - Populate RX avail ring with empty buffers so device has
-     *     somewhere to write incoming frames
-     *   - MapInterrupt + AddIntServer with vn_isr (still reads ISR
-     *     bit 0 for used-idx advancement — identical high-level flow
-     *     to e1000)
-     *   - virtio_driver_ok(base) to flip STATUS.DRIVER_OK
-     *   - Wire TX/RX bottom halves in dispatch to talk queues
-     */
-    LOGF(log, (CONST_STRPTR)"virtio init: STOPPING AT PHASE 10c — queues + IRQ not yet wired\n");
+    /* -------- Phase 10d: allocate virtqueues + publish PFN ----------
+     * One contiguous 4KB-aligned allocation per queue, VRING_TOTAL_BYTES
+     * sized. Zero-init (avail/used idx = 0, all descriptors dead).
+     * Resolve physical address, hand PFN to device. */
+    if (devBase->rx_vring_num == 0 || devBase->tx_vring_num == 0) {
+        LOGF(log, (CONST_STRPTR)"virtio: queue-num was 0 — device rejected setup, aborting\n");
+        vn_log_close(iexec, &log);
+        return (struct Library *)devBase;
+    }
+
+    {
+        ULONG rx_bytes = VRING_TOTAL_BYTES(devBase->rx_vring_num);
+        ULONG tx_bytes = VRING_TOTAL_BYTES(devBase->tx_vring_num);
+        devBase->rx_vring = iexec->AllocVecTags(rx_bytes,
+            AVT_Type,              MEMF_SHARED,
+            AVT_Contiguous,        TRUE,
+            AVT_PhysicalAlignment, TRUE,
+            AVT_Alignment,         4096,
+            AVT_ClearWithValue,    0,
+            TAG_END);
+        devBase->tx_vring = iexec->AllocVecTags(tx_bytes,
+            AVT_Type,              MEMF_SHARED,
+            AVT_Contiguous,        TRUE,
+            AVT_PhysicalAlignment, TRUE,
+            AVT_Alignment,         4096,
+            AVT_ClearWithValue,    0,
+            TAG_END);
+        if (!devBase->rx_vring || !devBase->tx_vring) {
+            LOGF(log, (CONST_STRPTR)"virtio: vring alloc FAILED (rx=%p tx=%p size rx=%lu tx=%lu)\n",
+                 devBase->rx_vring, devBase->tx_vring,
+                 (ULONG)rx_bytes, (ULONG)tx_bytes);
+            vn_log_close(iexec, &log);
+            return (struct Library *)devBase;
+        }
+        devBase->rx_vring_phys = vn_dma_phys(iexec, devBase->rx_vring, rx_bytes, 0);
+        devBase->tx_vring_phys = vn_dma_phys(iexec, devBase->tx_vring, tx_bytes, DMA_ReadFromRAM);
+        LOGF(log, (CONST_STRPTR)"virtio vrings: rx=%p phys=%08lx (%lu bytes)  tx=%p phys=%08lx (%lu bytes)\n",
+             devBase->rx_vring, (ULONG)devBase->rx_vring_phys, (ULONG)rx_bytes,
+             devBase->tx_vring, (ULONG)devBase->tx_vring_phys, (ULONG)tx_bytes);
+        if ((devBase->rx_vring_phys & 0xFFF) != 0 || (devBase->tx_vring_phys & 0xFFF) != 0) {
+            LOGF(log, (CONST_STRPTR)"virtio: vring NOT 4KB-aligned — device will reject PFN\n");
+            vn_log_close(iexec, &log);
+            return (struct Library *)devBase;
+        }
+
+        virtio_set_queue_pfn(devBase, VIRTIO_NET_Q_RX, devBase->rx_vring_phys);
+        virtio_set_queue_pfn(devBase, VIRTIO_NET_Q_TX, devBase->tx_vring_phys);
+    }
+
+    /* -------- Phase 10d: allocate RX buffer pool + populate avail ring ----
+     * One 2 KB buffer per RX descriptor. Fill each descriptor:
+     *   addr_lo = buffer's PCI-bus phys addr
+     *   addr_hi = 0 (we're 32-bit)
+     *   len     = 2048
+     *   flags   = VRING_DESC_F_WRITE  (device-writable)
+     *   next    = 0
+     * Then push every descriptor index onto avail->ring so the device
+     * has all 256 slots ready to receive. */
+    {
+        ULONG num = devBase->rx_vring_num;
+        ULONG pool_bytes = num * VN_RX_BUFSIZE;
+        devBase->rx_bufs = iexec->AllocVecTags(pool_bytes,
+            AVT_Type,              MEMF_SHARED,
+            AVT_Contiguous,        TRUE,
+            AVT_PhysicalAlignment, TRUE,
+            AVT_Alignment,         16,
+            AVT_ClearWithValue,    0,
+            TAG_END);
+        if (!devBase->rx_bufs) {
+            LOGF(log, (CONST_STRPTR)"virtio: rx_bufs alloc FAILED (%lu bytes)\n",
+                 (ULONG)pool_bytes);
+            vn_log_close(iexec, &log);
+            return (struct Library *)devBase;
+        }
+        devBase->rx_bufs_phys = vn_dma_phys(iexec, devBase->rx_bufs, pool_bytes, 0);
+        LOGF(log, (CONST_STRPTR)"virtio rx_bufs: cpu=%p phys=%08lx pool=%lu\n",
+             devBase->rx_bufs, (ULONG)devBase->rx_bufs_phys, (ULONG)pool_bytes);
+
+        /* Populate descriptor table (starts at rx_vring + 0). */
+        struct vring_desc *desc = (struct vring_desc *)devBase->rx_vring;
+        for (ULONG i = 0; i < num; i++) {
+            desc[i].addr_lo = devBase->rx_bufs_phys + (i * VN_RX_BUFSIZE);
+            desc[i].addr_hi = 0;
+            desc[i].len     = VN_RX_BUFSIZE;
+            desc[i].flags   = VRING_DESC_F_WRITE;
+            desc[i].next    = 0;
+        }
+        /* Populate avail ring. Its bytes live at offset
+         * VRING_AVAIL_OFFSET(num) within rx_vring; the ring[] array
+         * starts at the header's 4-byte prefix (flags+idx). */
+        UBYTE *avail_bytes = ((UBYTE *)devBase->rx_vring) + VRING_AVAIL_OFFSET(num);
+        struct vring_avail_header *avail = (struct vring_avail_header *)avail_bytes;
+        UWORD *avail_ring = (UWORD *)(avail_bytes + 4);
+        avail->flags = 0;
+        for (ULONG i = 0; i < num; i++) {
+            avail_ring[i] = (UWORD)i;
+        }
+        /* Publish avail-idx = num so device sees all descriptors as
+         * ready. Barrier before + after the idx bump (writing to
+         * shared RAM the device may race us on). */
+        __asm__ volatile ("eieio; sync" : : : "memory");
+        avail->idx = (UWORD)num;
+        __asm__ volatile ("eieio; sync" : : : "memory");
+
+        devBase->rx_next_avail = (UWORD)num;
+        devBase->rx_last_used  = 0;
+    }
+
+    /* -------- Phase 10e: install IRQ + flip DRIVER_OK ----------
+     * The device may start writing to our RX ring the moment we set
+     * DRIVER_OK, so install the IRQ handler FIRST. Existing vn_isr
+     * from the virte1000 fork reads e1000 ICR — we'd need to replace
+     * that read with a virtio ISR read for actual RX to work, but
+     * even the stub is enough to keep the vector claimed. */
+    if (devBase->pciDevice) {
+        devBase->irq_vector = devBase->pciDevice->MapInterrupt();
+        LOGF(log, (CONST_STRPTR)"MapInterrupt: vector=%lu\n", devBase->irq_vector);
+        if (devBase->irq_vector != 0) {
+            devBase->irq_node.is_Node.ln_Type = NT_INTERRUPT;
+            devBase->irq_node.is_Node.ln_Pri  = 0;
+            devBase->irq_node.is_Node.ln_Name = (STRPTR)DEVNAME;
+            devBase->irq_node.is_Data         = (APTR)devBase;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-function-type"
+            devBase->irq_node.is_Code = (VOID (*)())vn_isr;
+#pragma GCC diagnostic pop
+            BOOL ok = iexec->AddIntServer(devBase->irq_vector, &devBase->irq_node);
+            devBase->irq_installed = ok;
+            LOGF(log, (CONST_STRPTR)"AddIntServer: vec=%lu result=%s\n",
+                 devBase->irq_vector, ok ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED");
+        }
+    }
+
+    virtio_driver_ok(devBase);
+    LOGF(log, (CONST_STRPTR)"virtio: DRIVER_OK set, status=%02lx (device may now use queues)\n",
+         (ULONG)virtio_read_status(devBase));
 
     /* Phase 6k/l: unit task processes queued CMD_READ on ISR signal.
      * PHASE 7q: task ALSO creates its own begin_port + waits on it —
