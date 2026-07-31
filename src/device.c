@@ -1016,14 +1016,12 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * descriptor chain (header + frame linked via NEXT flag) and
      * QEMU rejects a single-descriptor TX with "bogus descriptor
      * or out of resources". */
-    /* Also accept VIRTIO_NET_F_MRG_RXBUF so we can use single-
-     * descriptor RX buffers. With MRG, virtio_net_hdr grows to 12
-     * bytes (adds num_buffers field). Without MRG (and without
-     * ANY_LAYOUT effective for RX), QEMU expects RX to be a 2-desc
-     * chain: header slot + data slot — causing "bogus descriptor"
-     * when we present single-desc RX buffers. */
+    /* Drop VIRTIO_NET_F_MRG_RXBUF — it grows virtio_net_hdr from 10
+     * to 12 bytes and we haven't updated VIRTIO_NET_HDR_LEN or the
+     * TX packet layout accordingly. Any-layout stays so we can use
+     * single-descriptor TX. */
     ULONG want_feat = VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS
-                    | VIRTIO_F_ANY_LAYOUT | VIRTIO_NET_F_MRG_RXBUF;
+                    | VIRTIO_F_ANY_LAYOUT;
     virtio_negotiate_features(devBase, want_feat);
     LOGF(log, (CONST_STRPTR)"virtio: device_features=%08lx driver_wants=%08lx accepted=%08lx\n",
          (ULONG)devBase->device_features, (ULONG)want_feat,
@@ -1186,18 +1184,20 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
             vio_le16_put(&desc[i].flags, VRING_DESC_F_WRITE);
             vio_le16_put(&desc[i].next, 0);
         }
-        /* PHASE 10j-2 DIAGNOSTIC: SKIP RX avail-ring population.
-         * Leave avail_idx=0 so QEMU sees no RX buffers ready. If
-         * "bogus descriptor" still appears on TX-notify, error is
-         * definitively TX-side. If error disappears entirely, error
-         * was from QEMU popping our RX descriptors. */
+        /* RESTORED: populate avail ring with all 256 slots. Phase 10j
+         * isolation test confirmed error is TX-side, not RX. */
         UBYTE *avail_bytes = ((UBYTE *)devBase->rx_vring) + VRING_AVAIL_OFFSET(num);
         struct vring_avail_header *avail = (struct vring_avail_header *)avail_bytes;
+        uint16 *avail_ring = (uint16 *)(avail_bytes + 4);
         vio_le16_put(&avail->flags, 0);
-        vio_le16_put(&avail->idx, 0);
+        for (ULONG i = 0; i < num; i++) {
+            vio_le16_put(&avail_ring[i], (uint16)i);
+        }
+        __asm__ volatile ("eieio; sync" : : : "memory");
+        vio_le16_put(&avail->idx, (uint16)num);
         __asm__ volatile ("eieio; sync" : : : "memory");
 
-        devBase->rx_next_avail = 0;
+        devBase->rx_next_avail = (UWORD)num;
         devBase->rx_last_used  = 0;
     }
 
