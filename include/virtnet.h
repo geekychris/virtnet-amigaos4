@@ -64,6 +64,14 @@ struct VirtnetBase
     APTR               tx_vring;
     ULONG              tx_vring_phys;
     UWORD              tx_vring_num;
+    /* Phase 10j-15: raw (pre-alignment) allocation pointers so we can
+     * FreeMem them. Set when using AllocMem+manual-align path; NULL
+     * when using AllocVecTags (which frees via FreeVec on the aligned
+     * pointer directly). */
+    APTR               rx_vring_raw;
+    ULONG              rx_vring_raw_size;
+    APTR               tx_vring_raw;
+    ULONG              tx_vring_raw_size;
     UWORD              tx_next_avail;
     UWORD              tx_last_used;
     APTR               tx_scratch2;       /* single TX bounce buffer (phase 10 stub) */

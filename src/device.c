@@ -1091,26 +1091,23 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
          * tx_scratch2 (2 KB) fits after the ring layout, keeping both
          * in a single AllocVecTags block. */
         ULONG tx_bytes = VRING_TOTAL_BYTES(devBase->tx_vring_num) + 4096;
-        /* Phase 10j-14b: MEMF_KICK|MEMF_SHARED for rings. Pure MEMF_KICK
-         * failed at 10KB (limited resource on OS4 sam460ex). Combined
-         * flag asks the allocator for KICK-compatible memory but falls
-         * back to SHARED if the low-RAM pool is exhausted. rtl8139 uses
-         * pure MEMF_KICK for 2KB buffers only; for larger rings we need
-         * something the allocator can actually satisfy. */
-        devBase->rx_vring = iexec->AllocVecTags(rx_bytes,
-            AVT_Type,              MEMF_KICK | MEMF_SHARED,
-            AVT_Contiguous,        TRUE,
-            AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment,         4096,
-            AVT_ClearWithValue,    0,
-            TAG_END);
-        devBase->tx_vring = iexec->AllocVecTags(tx_bytes,
-            AVT_Type,              MEMF_KICK | MEMF_SHARED,
-            AVT_Contiguous,        TRUE,
-            AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment,         4096,
-            AVT_ClearWithValue,    0,
-            TAG_END);
+        /* Phase 10j-15: try plain AllocMem(size, MEMF_KICK) instead of
+         * AllocVecTags. rtl8139 uses AllocMem for all its DMA buffers
+         * (3 sites at offset 104). AllocMem has no alignment tag — we
+         * over-allocate by 4KB and manually align. If AllocMem succeeds
+         * where AllocVecTags failed, that's evidence the AVT_* attribute
+         * tags force stricter physical placement than plain MEMF_KICK
+         * needs. */
+        ULONG rx_alloc = rx_bytes + 4096;
+        ULONG tx_alloc = tx_bytes + 4096;
+        APTR rx_raw = iexec->AllocMem(rx_alloc, MEMF_KICK | MEMF_CLEAR);
+        APTR tx_raw = iexec->AllocMem(tx_alloc, MEMF_KICK | MEMF_CLEAR);
+        devBase->rx_vring_raw = rx_raw;
+        devBase->tx_vring_raw = tx_raw;
+        devBase->rx_vring_raw_size = rx_alloc;
+        devBase->tx_vring_raw_size = tx_alloc;
+        devBase->rx_vring = rx_raw ? (APTR)(((ULONG)rx_raw + 4095UL) & ~4095UL) : NULL;
+        devBase->tx_vring = tx_raw ? (APTR)(((ULONG)tx_raw + 4095UL) & ~4095UL) : NULL;
         if (!devBase->rx_vring || !devBase->tx_vring) {
             LOGF(log, (CONST_STRPTR)"virtio: vring alloc FAILED (rx=%p tx=%p size rx=%lu tx=%lu)\n",
                  devBase->rx_vring, devBase->tx_vring,
@@ -1164,15 +1161,11 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
     {
         ULONG num = devBase->rx_vring_num;
         ULONG pool_bytes = num * VN_RX_BUFSIZE;
-        /* Phase 10j-14b: MEMF_KICK|MEMF_SHARED. 512KB pool won't fit in
-         * MEMF_KICK-only region. */
-        devBase->rx_bufs = iexec->AllocVecTags(pool_bytes,
-            AVT_Type,              MEMF_KICK | MEMF_SHARED,
-            AVT_Contiguous,        TRUE,
-            AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment,         16,
-            AVT_ClearWithValue,    0,
-            TAG_END);
+        /* Phase 10j-15: plain AllocMem for the 512 KB RX pool. Same path
+         * that succeeded for the rings. MEMF_SHARED (no KICK) since
+         * KICK region is too small for 512 KB. AllocMem returns 16-byte
+         * aligned by contract, sufficient for VRING descriptor addr. */
+        devBase->rx_bufs = iexec->AllocMem(pool_bytes, MEMF_SHARED | MEMF_CLEAR);
         if (!devBase->rx_bufs) {
             LOGF(log, (CONST_STRPTR)"virtio: rx_bufs alloc FAILED (%lu bytes)\n",
                  (ULONG)pool_bytes);
@@ -1219,17 +1212,19 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * single buffer + descriptor 0, serialized by the SANA-II dispatch
      * layer. */
     {
-        /* Phase 10j-14b: allocate tx_scratch2 as a SEPARATE 2KB block
-         * with pure MEMF_KICK — matches rtl8139's proven-working pattern
-         * for DMA-visible packet buffers. Small size fits comfortably in
-         * the MEMF_KICK region on OS4/sam460ex. */
-        devBase->tx_scratch2 = iexec->AllocVecTags((ULONG)2048,
-            AVT_Type,              MEMF_KICK,
-            AVT_Contiguous,        TRUE,
-            AVT_PhysicalAlignment, TRUE,
-            AVT_Alignment,         32,
-            AVT_ClearWithValue,    0,
-            TAG_END);
+        /* Phase 10j-16: PIGGYBACK tx_scratch2 inside tx_vring's tail.
+         *
+         * We over-allocated tx_vring by 4 KB precisely for this. QEMU
+         * has demonstrably read descriptors from tx_vring (virtqueue_pop
+         * fires successfully), so we know that alloc is DMA-visible.
+         * Separate AllocMem'd blocks — even with identical MEMF_KICK
+         * flags — showed zeros when QEMU followed a descriptor addr
+         * into them. Reusing tx_vring's known-good region guarantees
+         * QEMU can DMA-read the packet payload. */
+        ULONG scratch_offset = VRING_TOTAL_BYTES(devBase->tx_vring_num);
+        scratch_offset = (scratch_offset + 31) & ~31UL;
+        devBase->tx_scratch2 = (APTR)((UBYTE *)devBase->tx_vring + scratch_offset);
+        devBase->tx_scratch2_phys = devBase->tx_vring_phys + scratch_offset;
         if (!devBase->tx_scratch2) {
             LOGF(log, (CONST_STRPTR)"virtio: tx_scratch2 (MEMF_KICK) alloc FAILED\n");
             vn_log_close(iexec, &log);
@@ -1555,6 +1550,16 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
         if (devBase->rx_buffers)  { IExec->FreeVec(devBase->rx_buffers);  devBase->rx_buffers  = NULL; }
         if (devBase->tx_ring)     { IExec->FreeVec(devBase->tx_ring);     devBase->tx_ring     = NULL; }
         if (devBase->rx_ring)     { IExec->FreeVec(devBase->rx_ring);     devBase->rx_ring     = NULL; }
+        /* Phase 10j-15: rings allocated via AllocMem+manual-align; free
+         * the pre-alignment raw pointer with FreeMem. */
+        if (devBase->rx_vring_raw) {
+            IExec->FreeMem(devBase->rx_vring_raw, devBase->rx_vring_raw_size);
+            devBase->rx_vring_raw = NULL; devBase->rx_vring = NULL;
+        }
+        if (devBase->tx_vring_raw) {
+            IExec->FreeMem(devBase->tx_vring_raw, devBase->tx_vring_raw_size);
+            devBase->tx_vring_raw = NULL; devBase->tx_vring = NULL;
+        }
         if (devBase->bar0) {
             devBase->pciDevice->FreeResourceRange(devBase->bar0);
             devBase->bar0 = NULL;
@@ -2366,12 +2371,22 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
 
         ULONG total_bytes = VIRTIO_NET_HDR_LEN + eth_len;
 
-        /* Phase 10j-14: rtl8139-style — just flush cache + use init-time
-         * phys addr. MEMF_KICK memory is DMA-coherent, so no CachePreDMA
-         * translation is needed. CacheClearE ensures the CPU write is
-         * visible to the device DMA. */
-        IExec->CacheClearE((APTR)devBase->tx_scratch2, total_bytes,
-                           CACRF_ClearD | CACRF_InvalidateD);
+        /* Phase 10j-17: EXPLICIT dcbf per cacheline + sync/eieio.
+         * CacheClearE alone isn't reaching RAM for the payload region
+         * (QEMU DMA reads zeros). PPC 460EX has 32-byte cachelines.
+         * Use `dcbf` to flush each line explicitly, followed by sync
+         * to complete the store queue. This is the raw primitive that
+         * CacheClearE is supposed to call, but the OS4 wrapper may be
+         * missing some cachelines on partial writes. */
+        {
+            UBYTE *p = (UBYTE *)devBase->tx_scratch2;
+            ULONG start = (ULONG)p & ~31UL;
+            ULONG end   = ((ULONG)p + total_bytes + 31UL) & ~31UL;
+            for (ULONG a = start; a < end; a += 32) {
+                __asm__ volatile ("dcbf 0,%0" : : "r"(a) : "memory");
+            }
+            __asm__ volatile ("sync; eieio" : : : "memory");
+        }
         uint32 live_phys = devBase->tx_scratch2_phys;
 
         /* Single-descriptor TX (with ANY_LAYOUT negotiated). */
@@ -2382,9 +2397,8 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
         vio_le16_put(&tdesc[0].flags, 0);
         vio_le16_put(&tdesc[0].next, 0);
 
-        /* Flush descriptor RAM too so QEMU DMA-reads it fresh. */
-        IExec->CacheClearE((APTR)devBase->tx_vring, 16, CACRF_ClearD);
-        __asm__ volatile ("sync" : : : "memory");
+        /* Flush descriptor RAM (16 bytes = half a cacheline). */
+        __asm__ volatile ("dcbf 0,%0; sync" : : "r"((ULONG)devBase->tx_vring) : "memory");
 
         /* Save diagnostics. */
         devBase->last_copy_to_ptr = (APTR)(ULONG)live_phys;
