@@ -199,19 +199,27 @@ struct virtio_net_hdr {
  * descriptor and pcap shows a frame, this was the misdiagnosis. */
 static inline uint16 vio_le16_get(uint16 *p)
 {
-    return *(volatile uint16 *)p;   /* BE native read */
+    uint16 v;
+    __asm__ volatile ("lhbrx %0, 0, %1" : "=r"(v) : "r"(p) : "memory");
+    return v;
 }
 static inline void vio_le16_put(uint16 *p, uint16 val)
 {
-    *(volatile uint16 *)p = val;    /* BE native write */
+    __asm__ volatile ("sthbrx %0, 0, %1" : : "r"(val), "r"(p) : "memory");
 }
 static inline uint32 vio_le32_get(uint32 *p)
 {
-    return *(volatile uint32 *)p;
+    /* Byte-reversed load via lwbrx — QEMU virtio-net-pci on our
+     * sam460ex + PPC BE guest reads ring memory as LE despite the
+     * legacy-virtio spec saying "guest native". Match e1000's
+     * poke_le32 pattern to keep TX descriptors readable. */
+    uint32 v;
+    __asm__ volatile ("lwbrx %0, 0, %1" : "=r"(v) : "r"(p) : "memory");
+    return v;
 }
 static inline void vio_le32_put(uint32 *p, uint32 val)
 {
-    *(volatile uint32 *)p = val;
+    __asm__ volatile ("stwbrx %0, 0, %1" : : "r"(val), "r"(p) : "memory");
 }
 
 /* ---------- Prototypes (implemented in src/virtio.c) ---------- */

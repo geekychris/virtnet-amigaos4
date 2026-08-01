@@ -1230,8 +1230,11 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
             vn_log_close(iexec, &log);
             return (struct Library *)devBase;
         }
-        devBase->tx_scratch2_phys = vn_dma_phys(iexec, devBase->tx_scratch2, 2048, DMA_ReadFromRAM);
-        LOGF(log, (CONST_STRPTR)"virtio tx_scratch2 (MEMF_KICK): cpu=%p phys=%08lx\n",
+        /* DO NOT re-derive phys via vn_dma_phys — tx_scratch2 lives
+         * inside tx_vring's already-StartDMA'd range; a second
+         * StartDMA on overlapping memory returns 0, blanking the
+         * phys we computed correctly by arithmetic above. Just log. */
+        LOGF(log, (CONST_STRPTR)"virtio tx_scratch2 (piggyback): cpu=%p phys=%08lx\n",
              devBase->tx_scratch2, (ULONG)devBase->tx_scratch2_phys);
 
         /* Verify with IMMU that CPU phys matches DMA phys. */
