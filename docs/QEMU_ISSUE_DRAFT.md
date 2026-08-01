@@ -1,4 +1,27 @@
-# DRAFT: QEMU sam460ex PCI DMA drops guest→device writes on descriptor-based NICs
+# ⚠️ RETRACTED — DO NOT FILE THIS ISSUE
+
+The conclusion below ("QEMU is broken") is wrong. Linux runs
+successfully on QEMU sam460ex with e1000 and virtio-net, which proves
+the descriptor-DMA path works in QEMU. Our TX-shows-zeros symptom is
+almost certainly a bug on OUR AmigaOS 4 driver side — most likely one
+of:
+
+- Wrong endianness / byteswap on the descriptor `addr_lo` we publish
+  (never independently verified via `xp` on the descriptor bytes).
+- Wrong address kind — `GetDMAList` may return CPU-physical while
+  the NIC expects PCI-bus-physical, and we skip any translation that
+  the OS4 PCI stack would otherwise apply for `OutLong`-based paths.
+- Cache-line issue where our `CacheClearE(scratch, ...)` doesn't
+  actually reach the exact bytes we published.
+
+The original draft is preserved below only as a record of the
+investigation, NOT because it's ready to submit. If e1000 work
+resumes: verify our bytes actually match what QEMU's e1000 model
+receives before pointing fingers at QEMU.
+
+---
+
+# ORIGINAL DRAFT (RETRACTED) — QEMU sam460ex PCI DMA drops guest→device writes on descriptor-based NICs
 
 **QEMU version**: reproduced on 11.0.1, 11.0.3, and v11.1.0-rc2 (`QEMU emulator version 11.0.92 (v11.1.0-rc2)`, built from source)
 **Host**: macOS 14 arm64 (Homebrew build)
