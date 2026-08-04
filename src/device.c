@@ -694,6 +694,29 @@ static void vn_process_rx(struct VirtnetBase *base)
     base->rx_last_used = last;
     base->process_rx_delivered += delivered;
 
+    /* Phase 13d: under EVENT_IDX the device only interrupts us when
+     * its used->idx crosses the used_event we published in the avail
+     * ring's trailing slot. QEMU uses
+     *   need_event(event, new_idx, old_idx) =
+     *     (uint16)(new_idx - event - 1) < (uint16)(new_idx - old_idx)
+     * so with `event = last` (the used_idx we've already drained),
+     * the next arrival (old=last, new=last+1) evaluates to
+     * `0 < 1` = fire. Bumping to `last+1` would give `0xFFFF < 1`
+     * = false and we'd miss every wake — that path was tried and
+     * dropped perf 14x. */
+    if (base->driver_features & VIRTIO_F_RING_EVENT_IDX) {
+        uint16 *rx_used_event = (uint16 *)(avail_bytes + 4 + 2 * num);
+        vio_le16_put(rx_used_event, (uint16)last);
+        __asm__ volatile ("eieio; sync" : : : "memory");
+        /* If the device raced past our new used_event while we were
+         * arming it, we'll miss the interrupt for those entries.
+         * Since our task always re-runs after any ISR wake, this
+         * only matters when nothing else fires — the wake-loop below
+         * covers that by checking used->idx once more after we set
+         * the event. If it's ahead, we already know we still need to
+         * process; the vn_isr code will re-enter us. */
+    }
+
     if (iterated > 0) {
         __asm__ volatile ("eieio; sync" : : : "memory");
         virtio_notify_queue(base, VIRTIO_NET_Q_RX);
@@ -1052,9 +1075,18 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * csum_start / csum_offset. Roadshow doesn't have a "skip
      * checksum" knob, but CMD_WRITE below zeros the L4 checksum
      * after copy so QEMU's overwrite is the source of truth — no
-     * double-work-plus-wrong-value risk. */
+     * double-work-plus-wrong-value risk.
+     *
+     * Phase 13d: also try VIRTIO_F_RING_EVENT_IDX. Under this
+     * feature the driver writes a per-queue used_event value at the
+     * tail of the avail ring, and the device only interrupts when
+     * its used->idx crosses that value. Setting TX used_event to
+     * an unreachable value (0xFFFF) suppresses TX-completion IRQs
+     * entirely — we already reply-and-forget so completions carry
+     * no information for us. */
     ULONG want_feat = VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS
-                    | VIRTIO_F_ANY_LAYOUT | VIRTIO_NET_F_CSUM;
+                    | VIRTIO_F_ANY_LAYOUT | VIRTIO_NET_F_CSUM
+                    | VIRTIO_F_RING_EVENT_IDX;
     virtio_negotiate_features(devBase, want_feat);
     LOGF(log, (CONST_STRPTR)"virtio: device_features=%08lx driver_wants=%08lx accepted=%08lx\n",
          (ULONG)devBase->device_features, (ULONG)want_feat,
@@ -1322,6 +1354,26 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * Round to 2 KB for cache-line safety. All TX packets use this
      * single buffer + descriptor 0, serialized by the SANA-II dispatch
      * layer. */
+
+    /* -------- Phase 13d: EVENT_IDX initial setting ----------
+     * If VIRTIO_F_RING_EVENT_IDX was negotiated, set the TX avail
+     * ring's used_event to 0xFFFF so the device NEVER interrupts on
+     * TX completion — we reply-and-forget from CMD_WRITE so
+     * completion notifications carry zero information. Suppressing
+     * these saves one IRQ + task-wake per packet transmitted.
+     *
+     * RX avail's used_event stays at 0 (get an IRQ on the very
+     * first packet). vn_process_rx will bump it after each pass. */
+    if (devBase->driver_features & VIRTIO_F_RING_EVENT_IDX) {
+        UWORD tnum = devBase->tx_vring_num;
+        UBYTE *tavail = ((UBYTE *)devBase->tx_vring) + VRING_AVAIL_OFFSET(tnum);
+        /* used_event sits right after the ring[] array: offset
+         * 4 (header) + 2*num (ring). */
+        uint16 *tx_used_event = (uint16 *)(tavail + 4 + 2 * tnum);
+        vio_le16_put(tx_used_event, (uint16)0xFFFF);
+        LOGF(log, (CONST_STRPTR)"EVENT_IDX: TX used_event=0xFFFF (suppress TX-completion IRQs)\n");
+    }
+
     {
         /* Phase 10j-16: PIGGYBACK tx_scratch2 inside tx_vring's tail.
          *
