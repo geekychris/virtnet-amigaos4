@@ -1880,13 +1880,25 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
          * by supply, plus unconditional SizeSupplied (+4) and BPS
          * (+22) — trusting rtl8139's behavior since Roadshow demonstrably
          * accepts it. */
-        /* Hardcoded supply=24 — same as the test that WORKED earlier. */
-        ULONG supply = 24;
+        /* supply=34 covers the full pack(2) Sana2DeviceQuery through
+         * RawMTU (offset 30-33). Earlier the code was capped at 24 to
+         * match a "test that worked" but that skipped HardwareType at
+         * offset 26 — Roadshow then reported the interface type as
+         * "Unknown (0)" (visible in ShowNetStatus) and refused to
+         * forward frames out of it despite everything else being
+         * configured. rtl8139's own template is 34 bytes so the
+         * larger supply is what the wire-format-compatible caller
+         * expects anyway. */
+        ULONG supply = 34;
         if (supply > size_wire) supply = size_wire;
-        /* Zero-fill the 24 bytes we're going to write into — earlier
-         * test with this exact pattern let AddNetInterface succeed
-         * and query returned MTU=1500 State=2. */
-        for (ULONG i = 0; i < supply; i++) raw[i] = 0;
+        /* Zero-fill the fields we're going to write into. `volatile`
+         * defeats GCC's -O2 conversion of the loop into memset() — a
+         * resident-tag .device can't link against newlib's memset
+         * (INewlib is not resolved in this build). */
+        {
+            volatile UBYTE *vraw = raw;
+            for (ULONG i = 0; i < supply; i++) vraw[i] = 0;
+        }
 
         #define S2DQ_WU16(off, val)   do { \
             if (supply >= (off) + 2) { \
