@@ -183,6 +183,10 @@ struct virtio_net_hdr {
 
 #define VIRTIO_NET_HDR_LEN           10
 
+/* virtio_net_hdr.flags bits (spec §5.1.6.2) */
+#define VIRTIO_NET_HDR_F_NEEDS_CSUM  0x01  /* driver requests device L4 csum */
+#define VIRTIO_NET_HDR_F_DATA_VALID  0x02  /* device says L4 csum is verified */
+
 /* virtio-net status field (only if VIRTIO_NET_F_STATUS negotiated) */
 #define VIRTIO_NET_S_LINK_UP         1
 #define VIRTIO_NET_S_ANNOUNCE        2

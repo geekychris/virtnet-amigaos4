@@ -1047,8 +1047,14 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
      * to 12 bytes and we haven't updated VIRTIO_NET_HDR_LEN or the
      * TX packet layout accordingly. Any-layout stays so we can use
      * single-descriptor TX. */
+    /* Phase 13c: also try VIRTIO_NET_F_CSUM. QEMU will L4-checksum
+     * for us if we set VIRTIO_NET_HDR_F_NEEDS_CSUM per packet plus
+     * csum_start / csum_offset. Roadshow doesn't have a "skip
+     * checksum" knob, but CMD_WRITE below zeros the L4 checksum
+     * after copy so QEMU's overwrite is the source of truth — no
+     * double-work-plus-wrong-value risk. */
     ULONG want_feat = VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS
-                    | VIRTIO_F_ANY_LAYOUT;
+                    | VIRTIO_F_ANY_LAYOUT | VIRTIO_NET_F_CSUM;
     virtio_negotiate_features(devBase, want_feat);
     LOGF(log, (CONST_STRPTR)"virtio: device_features=%08lx driver_wants=%08lx accepted=%08lx\n",
          (ULONG)devBase->device_features, (ULONG)want_feat,
@@ -2577,6 +2583,46 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
         if (eth_len < 60) eth_len = 60;
 
         ULONG total_bytes = VIRTIO_NET_HDR_LEN + eth_len;
+
+        /* Phase 13c: L4 checksum offload hint. If VIRTIO_NET_F_CSUM
+         * was negotiated and this frame is an IPv4 TCP or UDP packet
+         * (ethertype 0x0800, ip_proto 6 or 17), zero the L4 checksum
+         * in the buffer and tell QEMU where to insert the fresh one.
+         * Roadshow's already-computed checksum bytes get discarded
+         * but that only costs us a couple of writes; QEMU running on
+         * host CPU is much faster at the actual checksum arithmetic
+         * than PPC-emulated Roadshow so the net swap is a win.
+         *
+         * eth layout: [dst 6][src 6][type 2][ip_hdr ≥20][l4...]
+         * ip_hdr[0]&0x0F = IHL in 32-bit words → IP header length.
+         * ip_hdr[9] = protocol.
+         * TCP checksum offset in TCP header = 16.
+         * UDP checksum offset in UDP header = 6.  */
+        if ((devBase->driver_features & VIRTIO_NET_F_CSUM) && eth_len >= 34) {
+            volatile UBYTE *v = eth;
+            if (v[12] == 0x08 && v[13] == 0x00) {
+                UBYTE ihl_words = v[14] & 0x0F;
+                if (ihl_words >= 5) {
+                    ULONG ip_hdr_len = (ULONG)ihl_words * 4UL;
+                    ULONG l4_off = 14UL + ip_hdr_len;
+                    UBYTE proto = v[14 + 9];
+                    UWORD csum_off = 0xFFFF;
+                    if (proto == 6 && eth_len >= l4_off + 20)  csum_off = 16;    /* TCP */
+                    else if (proto == 17 && eth_len >= l4_off + 8) csum_off = 6; /* UDP */
+                    if (csum_off != 0xFFFF) {
+                        struct virtio_net_hdr *vh = (struct virtio_net_hdr *)dst;
+                        vh->flags       = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+                        vh->csum_start  = (uint16)l4_off;
+                        vh->csum_offset = csum_off;
+                        /* Zero the existing checksum bytes so QEMU's
+                         * overwrite is idempotent and we can't ship a
+                         * stale sum if the hint path ever mis-triggers. */
+                        v[l4_off + csum_off]     = 0;
+                        v[l4_off + csum_off + 1] = 0;
+                    }
+                }
+            }
+        }
 
         /* Phase 10j-17 / 13b: explicit dcbf per cacheline for THIS
          * slot's buffer, then sync/eieio. PPC 460EX = 32-byte lines. */
