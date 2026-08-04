@@ -76,6 +76,15 @@ struct VirtnetBase
     UWORD              tx_last_used;
     APTR               tx_scratch2;       /* single TX bounce buffer (phase 10 stub) */
     ULONG              tx_scratch2_phys;
+    /* Phase 13b: per-slot TX scratch pool. Single tx_scratch2 forced a
+     * completion poll before every reuse; that poll effectively caps
+     * throughput to serial round-trip latency and, worse, silently
+     * corrupts frames when it times out with QEMU still DMA-reading.
+     * Pool of tx_pool_slots × VN_TX_SLOT_SIZE lets each in-flight
+     * descriptor carry its own buffer. */
+    APTR               tx_pool;
+    ULONG              tx_pool_phys;
+    UWORD              tx_pool_slots;     /* slot count = ring-slot mod value */
 
     /* Cached hardware state — read once at Init from RAL/RAH. Serves
      * S2_GETSTATIONADDRESS + S2_DEVICEQUERY without re-hitting MMIO on

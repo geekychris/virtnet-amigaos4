@@ -496,6 +496,13 @@ static inline void   e1000_write32(volatile void *base, uint32 off, uint32 val);
 #define VN_RING_ENTRIES   16
 #define VN_DESC_SIZE      16
 #define VN_RX_BUFSIZE     2048
+/* Phase 13b: per-slot TX scratch pool sizing. 2KB per slot fits any
+ * virtio_net_hdr (10) + max Ethernet frame (1514). 32 slots × 2KB =
+ * 64KB total. desc_slot in CMD_WRITE picks a slot via modulo, so
+ * long as Roadshow can't queue >32 TX requests faster than QEMU
+ * drains them, no in-flight buffer gets overwritten. */
+#define VN_TX_SLOT_SIZE   2048UL
+#define VN_TX_POOL_SLOTS  32UL
 
 /* SANA-II Rev 4 has two CopyTo/CopyFromBuff ABIs. The classic tag
  * S2_CopyToBuff / S2_CopyFromBuff points at a m68k asm function that
@@ -1344,6 +1351,29 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         }
     }
 
+    /* -------- Phase 13b: TX scratch pool ----------
+     * Separate allocation of VN_TX_POOL_SLOTS × VN_TX_SLOT_SIZE. Same
+     * AllocMem(MEMF_SHARED|MEMF_CLEAR) pattern that already works for
+     * the RX buffer pool — QEMU DMA-reads land in the same physical
+     * pages the CPU wrote. CMD_WRITE later picks pool[desc_slot % N]
+     * so back-to-back TX from Roadshow can't overwrite an in-flight
+     * slot's buffer. */
+    {
+        ULONG tx_pool_bytes = VN_TX_POOL_SLOTS * VN_TX_SLOT_SIZE;
+        devBase->tx_pool = iexec->AllocMem(tx_pool_bytes, MEMF_SHARED | MEMF_CLEAR);
+        if (!devBase->tx_pool) {
+            LOGF(log, (CONST_STRPTR)"virtio: tx_pool alloc FAILED (%lu bytes)\n",
+                 (ULONG)tx_pool_bytes);
+            vn_log_close(iexec, &log);
+            return (struct Library *)devBase;
+        }
+        devBase->tx_pool_phys  = vn_dma_phys(iexec, devBase->tx_pool, tx_pool_bytes, DMA_ReadFromRAM);
+        devBase->tx_pool_slots = (UWORD)VN_TX_POOL_SLOTS;
+        LOGF(log, (CONST_STRPTR)"virtio tx_pool: cpu=%p phys=%08lx slots=%lu size=%lu\n",
+             devBase->tx_pool, (ULONG)devBase->tx_pool_phys,
+             (ULONG)VN_TX_POOL_SLOTS, (ULONG)tx_pool_bytes);
+    }
+
     /* -------- Phase 10e: install IRQ + flip DRIVER_OK ----------
      * The device may start writing to our RX ring the moment we set
      * DRIVER_OK, so install the IRQ handler FIRST. Existing vn_isr
@@ -1645,6 +1675,10 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
 
         if (devBase->tx_scratch)  { IExec->FreeVec(devBase->tx_scratch);  devBase->tx_scratch  = NULL; }
         if (devBase->tx_scratch2) { IExec->FreeVec(devBase->tx_scratch2); devBase->tx_scratch2 = NULL; }
+        if (devBase->tx_pool) {
+            IExec->FreeMem(devBase->tx_pool, VN_TX_POOL_SLOTS * VN_TX_SLOT_SIZE);
+            devBase->tx_pool = NULL;
+        }
         if (devBase->rx_buffers)  { IExec->FreeVec(devBase->rx_buffers);  devBase->rx_buffers  = NULL; }
         if (devBase->tx_ring)     { IExec->FreeVec(devBase->tx_ring);     devBase->tx_ring     = NULL; }
         if (devBase->rx_ring)     { IExec->FreeVec(devBase->rx_ring);     devBase->rx_ring     = NULL; }
@@ -2458,18 +2492,22 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
 
         ULONG len = ioreq->ios2_DataLength;
         if (len == 0 || len > 1514 || !ioreq->ios2_Data ||
-            !devBase->tx_scratch2 || !devBase->tx_vring) {
+            !devBase->tx_pool || !devBase->tx_vring) {
             ioreq->ios2_Req.io_Error = S2ERR_MTU_EXCEEDED;
             ioreq->ios2_WireError    = S2WERR_GENERIC_ERROR;
             break;
         }
         ioreq->ios2_WireError = 0;
 
-        UBYTE *dst = (UBYTE *)devBase->tx_scratch2;
-
-        /* Phase 10j-10 MARKER TEST: write a distinctive byte pattern
-         * so we can tell in pcap whether ANY of our data reaches QEMU. */
-        for (int i = 0; i < 128; i++) dst[i] = (UBYTE)(0xAA ^ (i & 0xFF));
+        /* Phase 13b: pick a pool slot BEFORE cooking so subsequent
+         * writes land in this slot's buffer (not the shared scratch). */
+        UWORD tx_num_early = devBase->tx_vring_num;
+        uint16 tx_avail_now = vio_le16_get(
+            (uint16 *)(((UBYTE *)devBase->tx_vring) + VRING_AVAIL_OFFSET(tx_num_early) + 2));
+        UWORD desc_slot = (UWORD)(tx_avail_now % tx_num_early);
+        UWORD pool_slot = (UWORD)(desc_slot & (VN_TX_POOL_SLOTS - 1));
+        UBYTE *dst = (UBYTE *)devBase->tx_pool + pool_slot * VN_TX_SLOT_SIZE;
+        uint32 live_phys = devBase->tx_pool_phys + pool_slot * VN_TX_SLOT_SIZE;
 
         /* Zero virtio_net_hdr[0..9]. */
         for (int i = 0; i < VIRTIO_NET_HDR_LEN; i++) dst[i] = 0;
@@ -2534,15 +2572,10 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
 
         ULONG total_bytes = VIRTIO_NET_HDR_LEN + eth_len;
 
-        /* Phase 10j-17: EXPLICIT dcbf per cacheline + sync/eieio.
-         * CacheClearE alone isn't reaching RAM for the payload region
-         * (QEMU DMA reads zeros). PPC 460EX has 32-byte cachelines.
-         * Use `dcbf` to flush each line explicitly, followed by sync
-         * to complete the store queue. This is the raw primitive that
-         * CacheClearE is supposed to call, but the OS4 wrapper may be
-         * missing some cachelines on partial writes. */
+        /* Phase 10j-17 / 13b: explicit dcbf per cacheline for THIS
+         * slot's buffer, then sync/eieio. PPC 460EX = 32-byte lines. */
         {
-            UBYTE *p = (UBYTE *)devBase->tx_scratch2;
+            UBYTE *p = dst;
             ULONG start = (ULONG)p & ~31UL;
             ULONG end   = ((ULONG)p + total_bytes + 31UL) & ~31UL;
             for (ULONG a = start; a < end; a += 32) {
@@ -2550,19 +2583,7 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
             }
             __asm__ volatile ("sync; eieio" : : : "memory");
         }
-        uint32 live_phys = devBase->tx_scratch2_phys;
 
-        /* Multi-descriptor TX: rotate through the descriptor table so
-         * we don't keep re-using desc 0. QEMU on this build only
-         * processes the FIRST push per desc slot per virtqueue lifetime
-         * and silently ignores repeated pushes of the same descriptor
-         * (empirically: trace shows notifies fire but virtqueue_pop
-         * only ever runs once even after the used ring has been marked).
-         * Rotating means each CMD_WRITE uses a fresh descriptor index. */
-        UWORD tx_num_early = devBase->tx_vring_num;
-        uint16 tx_avail_now = vio_le16_get(
-            (uint16 *)(((UBYTE *)devBase->tx_vring) + VRING_AVAIL_OFFSET(tx_num_early) + 2));
-        UWORD desc_slot = (UWORD)(tx_avail_now % tx_num_early);
         struct vring_desc *tdesc = (struct vring_desc *)devBase->tx_vring;
         vio_le32_put(&tdesc[desc_slot].addr_lo, live_phys);
         vio_le32_put(&tdesc[desc_slot].addr_hi, 0);
@@ -2619,17 +2640,10 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
         }
         virtio_notify_queue(devBase, VIRTIO_NET_Q_TX);
 
-        /* Poll TX used ring briefly for completion. */
-        UBYTE *tused_bytes = ((UBYTE *)devBase->tx_vring) + VRING_USED_OFFSET(tx_num);
-        struct vring_used_header *tused = (struct vring_used_header *)tused_bytes;
-        uint16 want_idx = cur_avail + 1;
-        BOOL done = FALSE;
-        for (int i = 0; i < 10000; i++) {
-            __asm__ volatile ("eieio; sync" : : : "memory");
-            if (vio_le16_get(&tused->idx) == want_idx) { done = TRUE; break; }
-        }
-        (void)done;
-        /* Bookkeeping only — TX completion doesn't gate our reply. */
+        /* Phase 13b: no completion poll. Each slot has its own buffer,
+         * so QEMU's DMA-read window (typically microseconds) can never
+         * race the next CMD_WRITE. Reply-and-forget cuts per-packet
+         * latency by whatever the poll averaged. */
         break;
     }
 
