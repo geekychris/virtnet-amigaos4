@@ -101,9 +101,19 @@
 /* Used ring flags */
 #define VRING_USED_F_NO_NOTIFY       1
 
+/* Virtio spec defines desc.addr as a single 64-bit value. QEMU reads
+ * it as one BE 64-bit load on this target. When we split it into two
+ * 32-bit fields, addr_hi MUST come first for BE hosts so that the low
+ * 32 bits of the 64-bit value land in the low bytes.
+ *
+ * Concrete debug: with addr_lo-first, writing addr_lo=0x3F33E820 and
+ * addr_hi=0 produced QEMU's decoded `addr 0x3f33e82000000000` (our
+ * addr_lo interpreted as the high half). Reversing puts addr_lo in
+ * bytes 4-7 and addr_hi in bytes 0-3, so BE 64-bit read yields
+ * 0x00000000_3F33E820 = the real buffer. */
 struct vring_desc {
-    uint32 addr_lo;      /* Buffer physical address low 32 bits */
     uint32 addr_hi;      /* Buffer physical address high 32 bits (== 0 on 32-bit) */
+    uint32 addr_lo;      /* Buffer physical address low 32 bits */
     uint32 len;          /* Buffer length in bytes */
     uint16 flags;        /* NEXT | WRITE | INDIRECT */
     uint16 next;         /* Next descriptor if flags & NEXT */
@@ -191,36 +201,25 @@ struct virtio_net_hdr {
  * struct field access via -> can't easily invoke them. The compiler
  * usually collapses these to lwbrx / sthbrx anyway. */
 
-/* Phase 10j-6 THEORY REVISION: QEMU virtio-net-pci on sam460ex may
- * actually treat the ring as guest-native (BE on PPC) for legacy
- * transitional. Prior "rx_dd_seen=4 with garbage indices" may have
- * been stale state, not conclusive evidence for LE. Switching helpers
- * to BE (native) writes as a test — if QEMU now accepts our
- * descriptor and pcap shows a frame, this was the misdiagnosis. */
-static inline uint16 vio_le16_get(uint16 *p)
-{
-    uint16 v;
-    __asm__ volatile ("lhbrx %0, 0, %1" : "=r"(v) : "r"(p) : "memory");
-    return v;
-}
-static inline void vio_le16_put(uint16 *p, uint16 val)
-{
-    __asm__ volatile ("sthbrx %0, 0, %1" : : "r"(val), "r"(p) : "memory");
-}
-static inline uint32 vio_le32_get(uint32 *p)
-{
-    /* Byte-reversed load via lwbrx — QEMU virtio-net-pci on our
-     * sam460ex + PPC BE guest reads ring memory as LE despite the
-     * legacy-virtio spec saying "guest native". Match e1000's
-     * poke_le32 pattern to keep TX descriptors readable. */
-    uint32 v;
-    __asm__ volatile ("lwbrx %0, 0, %1" : "=r"(v) : "r"(p) : "memory");
-    return v;
-}
-static inline void vio_le32_put(uint32 *p, uint32 val)
-{
-    __asm__ volatile ("stwbrx %0, 0, %1" : : "r"(val), "r"(p) : "memory");
-}
+/* Phase 13: switch to GUEST-NATIVE (BE on PPC) ring accesses.
+ *
+ * QEMU 11's `info virtio-status /machine/.../virtio-backend` explicitly
+ * reports `endianness: big` for this legacy virtio-net-pci-legacy on
+ * sam460ex. The byteswap-to-LE variant (added in Phase 10j-18) is
+ * therefore mismatched: our LE writes present as byte-reversed BE
+ * from QEMU's side, so descriptor len=2048 (0x800) reads back as
+ * 524288 (0x80000) and QEMU flags "bogus descriptor or out of
+ * resources", then latches `broken: true` and stops processing the
+ * whole virtqueue. That's exactly the symptom this fix targets.
+ *
+ * Consequence: descriptor + avail/used ring memory is now BE-native.
+ * Every field access uses plain reads/writes; the compiler emits
+ * regular lwz/stw/lhz/sth on this BE target. Guest and device agree.
+ */
+static inline uint16 vio_le16_get(uint16 *p)       { return *p; }
+static inline void   vio_le16_put(uint16 *p, uint16 val) { *p = val; }
+static inline uint32 vio_le32_get(uint32 *p)       { return *p; }
+static inline void   vio_le32_put(uint32 *p, uint32 val) { *p = val; }
 
 /* ---------- Prototypes (implemented in src/virtio.c) ---------- */
 
