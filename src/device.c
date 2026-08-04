@@ -279,6 +279,17 @@ static inline void poke_le32(volatile void *p, uint32 v)
     __asm__ volatile ("stwbrx %0, 0, %1" : : "r"(v), "r"(p) : "memory");
 }
 
+/* Phase 13e: read PPC time-base register (lower 32 bits). One
+ * instruction (mftb), a few cycles. Wraps every 43 s at 100 MHz TB
+ * — fine for accumulating per-stage deltas during a benchmark.
+ * SPR 268 on Book-E (`mfspr rX, TBL` = `mftb rX`). */
+static inline uint32 vn_tb(void)
+{
+    uint32 t;
+    __asm__ volatile ("mftb %0" : "=r"(t));
+    return t;
+}
+
 /* Full memory barrier — ensures all prior stores complete before any
  * subsequent memory ops. Required after building a descriptor and
  * before writing the doorbell (TDT) so HW sees a consistent descriptor.
@@ -615,6 +626,8 @@ static BOOL vn_invoke_copy_from(struct VirtnetBase *base,
 static void vn_process_rx(struct VirtnetBase *base)
 {
     if (!base->rx_vring || !base->IUtility) return;
+    uint32 _pr0 = vn_tb();     /* Phase 13e: RX profile entry */
+    uint32 _pr_hook_c = 0;     /* accumulate copy-hook cycles inside loop */
     struct ExecIFace *IExec = base->IExec;
 
     UWORD num = base->rx_vring_num;
@@ -678,7 +691,9 @@ static void vn_process_rx(struct VirtnetBase *base)
             ioreq->ios2_PacketType = ((ULONG)eth[12] << 8) | (ULONG)eth[13];
             ioreq->ios2_DataLength = payload_len;
 
+            uint32 _pr_hook_start = vn_tb();
             BOOL ok = vn_invoke_copy_to(base, op, ioreq, eth + 14, payload_len);
+            _pr_hook_c += (vn_tb() - _pr_hook_start);
             ioreq->ios2_Req.io_Error = ok ? 0 : S2ERR_NO_RESOURCES;
             IExec->ReplyMsg((struct Message *)ioreq);
             if (ok) delivered++;
@@ -720,6 +735,16 @@ static void vn_process_rx(struct VirtnetBase *base)
     if (iterated > 0) {
         __asm__ volatile ("eieio; sync" : : : "memory");
         virtio_notify_queue(base, VIRTIO_NET_Q_RX);
+    }
+
+    /* Phase 13e: RX profile — accumulate. Only count invocations
+     * that actually did work (iterated > 0); empty wakes would
+     * inflate the average. */
+    if (iterated > 0) {
+        base->prof_rx_calls++;
+        base->prof_rx_pkts   += delivered;
+        base->prof_rx_c_hook += _pr_hook_c;
+        base->prof_rx_c_total += (vn_tb() - _pr0);
     }
 }
 
@@ -1857,7 +1882,7 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
     UWORD cmd = ioreq->ios2_Req.io_Command;
     if (cmd == VN_DBG_STATUS || cmd == VN_DBG_CMDLOG ||
         cmd == VN_DBG_DQBUF   || cmd == VN_DBG_CFGBUF ||
-        cmd == VN_DBG_DUMPTX) {
+        cmd == VN_DBG_DUMPTX  || cmd == VN_DBG_PROFILE) {
         vn_dispatch_ioreq(devBase, ioreq);
         return;
     }
@@ -2330,6 +2355,37 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
         break;
     }
 
+    case VN_DBG_PROFILE: {
+        /* Phase 13e: dump per-stage cycle counters. Ten ULONGs
+         * (BE-encoded) laid into ios2_Data. See VN_DBG_PROFILE in
+         * virtnet.h for the slot layout. Caller must supply >=40
+         * bytes in ios2_Data.  */
+        UBYTE *out = (UBYTE *)ioreq->ios2_Data;
+        if (!out || ioreq->ios2_DataLength < 40) {
+            ioreq->ios2_Req.io_Error = IOERR_BADLENGTH;
+            break;
+        }
+        ULONG v[10];
+        v[0] = devBase->prof_tx_calls;
+        v[1] = devBase->prof_tx_c_total;
+        v[2] = devBase->prof_tx_c_cook;
+        v[3] = devBase->prof_tx_c_flush;
+        v[4] = devBase->prof_tx_c_ring;
+        v[5] = devBase->prof_tx_c_notify;
+        v[6] = devBase->prof_rx_calls;
+        v[7] = devBase->prof_rx_pkts;
+        v[8] = devBase->prof_rx_c_total;
+        v[9] = devBase->prof_rx_c_hook;
+        for (int i = 0; i < 10; i++) {
+            out[i*4 + 0] = (UBYTE)(v[i] >> 24);
+            out[i*4 + 1] = (UBYTE)(v[i] >> 16);
+            out[i*4 + 2] = (UBYTE)(v[i] >>  8);
+            out[i*4 + 3] = (UBYTE)(v[i]      );
+        }
+        ioreq->ios2_DataLength = 40;
+        break;
+    }
+
     case VN_DBG_FIRE_IRQ: {
         /* Force one ISR fire via ICS. Only meaningful when we're ONLINE
          * (IMS unmask must have already happened) — otherwise ICR bits
@@ -2522,6 +2578,7 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
     case VN_DBG_SEND:
     case CMD_WRITE:
     case S2_BROADCAST: {
+        uint32 _pt0 = vn_tb();  /* Phase 13e: TX profile — handler entry */
         /* Phase 10f: virtio TX path.
          *
          * Layout in tx_scratch2:
@@ -2635,6 +2692,7 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
         if (eth_len < 60) eth_len = 60;
 
         ULONG total_bytes = VIRTIO_NET_HDR_LEN + eth_len;
+        uint32 _pt_cook_end = vn_tb();
 
         /* Phase 13c: L4 checksum offload hint. If VIRTIO_NET_F_CSUM
          * was negotiated and this frame is an IPv4 TCP or UDP packet
@@ -2676,6 +2734,7 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
             }
         }
 
+        uint32 _pt_flush_start = vn_tb();
         /* Phase 10j-17 / 13b: explicit dcbf per cacheline for THIS
          * slot's buffer, then sync/eieio. PPC 460EX = 32-byte lines. */
         {
@@ -2687,6 +2746,7 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
             }
             __asm__ volatile ("sync; eieio" : : : "memory");
         }
+        uint32 _pt_flush_end = vn_tb();
 
         struct vring_desc *tdesc = (struct vring_desc *)devBase->tx_vring;
         vio_le32_put(&tdesc[desc_slot].addr_lo, live_phys);
@@ -2742,12 +2802,28 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
             }
             __asm__ volatile ("sync; eieio" : : : "memory");
         }
+        uint32 _pt_ring_end = vn_tb();
+
         virtio_notify_queue(devBase, VIRTIO_NET_Q_TX);
+        uint32 _pt_notify_end = vn_tb();
 
         /* Phase 13b: no completion poll. Each slot has its own buffer,
          * so QEMU's DMA-read window (typically microseconds) can never
          * race the next CMD_WRITE. Reply-and-forget cuts per-packet
          * latency by whatever the poll averaged. */
+
+        /* Phase 13e: accumulate profile counters. Stage names:
+         *   cook   = frame build + copy-hook + padding + total_bytes
+         *   flush  = dcbf loop over payload + sync/eieio
+         *   ring   = desc fill + avail push + dcbf loop + sync
+         *   notify = MMIO write to QUEUE_NOTIFY port
+         * Uint32 subtraction handles TB wrap naturally. */
+        devBase->prof_tx_calls++;
+        devBase->prof_tx_c_cook   += (_pt_cook_end   - _pt0);
+        devBase->prof_tx_c_flush  += (_pt_flush_end  - _pt_flush_start);
+        devBase->prof_tx_c_ring   += (_pt_ring_end   - _pt_flush_end);
+        devBase->prof_tx_c_notify += (_pt_notify_end - _pt_ring_end);
+        devBase->prof_tx_c_total  += (_pt_notify_end - _pt0);
         break;
     }
 

@@ -208,6 +208,28 @@ struct VirtnetBase
     volatile ULONG      process_rx_dd_seen;
     volatile ULONG      process_rx_delivered;
 
+    /* Phase 13e: per-stage cycle profiling. Enabled when
+     * VN_PROFILE=1 at compile time (default). Every counter
+     * accumulates PPC TB (time-base) deltas so we can divide by
+     * the call count to get avg cycles per stage. TB runs at
+     * ~50-100 MHz on sam460ex — check `mfspr 268` in QEMU monitor
+     * or measure with a known-duration sleep to convert to ns.
+     *
+     * Cycle counters are uint32 — at 100 MHz that wraps every 43 s
+     * of accumulated stage-time, which is a couple hours of wall
+     * clock at our packet rate. Fine for a 10-30 s benchmark
+     * window; reset by rebooting the driver.  */
+    volatile ULONG      prof_tx_calls;
+    volatile ULONG      prof_tx_c_total;    /* total cycles in CMD_WRITE handler */
+    volatile ULONG      prof_tx_c_cook;     /* cook frame (copy hook + hdr) */
+    volatile ULONG      prof_tx_c_flush;    /* dcbf loop over payload */
+    volatile ULONG      prof_tx_c_ring;     /* desc fill + avail push + barriers */
+    volatile ULONG      prof_tx_c_notify;   /* MMIO write to QUEUE_NOTIFY */
+    volatile ULONG      prof_rx_calls;      /* # vn_process_rx invocations */
+    volatile ULONG      prof_rx_pkts;       /* # frames delivered via hook */
+    volatile ULONG      prof_rx_c_total;    /* total cycles in vn_process_rx */
+    volatile ULONG      prof_rx_c_hook;     /* CallHookPkt total */
+
     /* Debug counters for copy-hook isolation (Phase 8). Incremented on
      * every vn_invoke_copy_to/from entry BEFORE we (would) call the
      * caller's function. last_* captures the pointer/tag/size of the
@@ -380,5 +402,20 @@ struct V1000Opener
                                      * ios2_Data[0..79]  = before
                                      * ios2_Data[80..159] = after
                                      * Caller supplies >=160-byte buf. */
+
+#define VN_DBG_PROFILE  0xF009   /* Dump per-stage cycle counters.
+                                     * Fills ios2_Data with an array
+                                     * of ULONGs (BE), 10 slots:
+                                     *   [0] prof_tx_calls
+                                     *   [1] prof_tx_c_total
+                                     *   [2] prof_tx_c_cook
+                                     *   [3] prof_tx_c_flush
+                                     *   [4] prof_tx_c_ring
+                                     *   [5] prof_tx_c_notify
+                                     *   [6] prof_rx_calls
+                                     *   [7] prof_rx_pkts
+                                     *   [8] prof_rx_c_total
+                                     *   [9] prof_rx_c_hook
+                                     * Caller supplies >=40-byte buf. */
 
 #endif

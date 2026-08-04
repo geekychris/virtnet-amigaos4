@@ -41,7 +41,7 @@ DEV_DBG  = $(BUILD)/virtnet.device.debug
 
 # Add every test binary here as it lands. Each corresponds to
 # tests/<name>.c, compiled the same way.
-TEST_NAMES = testopen testdeviceq testmac testirq testonline testtx testrx testtx_cooked testrx_cooked testrxtask testroadshow testdiag testsizeof testdqbuf testcfgbuf testbsdadd testquery teststat testrawstat
+TEST_NAMES = testopen testdeviceq testmac testirq testonline testtx testrx testtx_cooked testrx_cooked testrxtask testroadshow testdiag testsizeof testdqbuf testcfgbuf testbsdadd testquery teststat testrawstat testprofile
 TESTS      = $(patsubst %,$(BUILD)/%,$(TEST_NAMES))
 
 DEV_SRC  = src/device.c src/virtio.c
