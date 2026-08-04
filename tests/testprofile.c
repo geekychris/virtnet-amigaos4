@@ -48,13 +48,13 @@ int main(int argc, char **argv)
         return 20;
     }
 
-    UBYTE buf[40];
-    for (int i = 0; i < 40; i++) buf[i] = 0;
+    UBYTE buf[44];
+    for (int i = 0; i < 44; i++) buf[i] = 0;
 
     req->ios2_Req.io_Command = VN_DBG_PROFILE;
     req->ios2_Req.io_Error   = 0;
     req->ios2_Data           = buf;
-    req->ios2_DataLength     = 40;
+    req->ios2_DataLength     = 44;
     IExec->DoIO((struct IORequest *)req);
     if (req->ios2_Req.io_Error) {
         IDOS->Printf("DBG_PROFILE failed: ioerr=%ld\n",
@@ -72,6 +72,7 @@ int main(int argc, char **argv)
     ULONG rx_pkts   = read_be32(buf + 28);
     ULONG rx_total  = read_be32(buf + 32);
     ULONG rx_hook   = read_be32(buf + 36);
+    ULONG tx_hook   = read_be32(buf + 40);
 
     IDOS->Printf("--- virtnet TX profile ---\n");
     IDOS->Printf("  tx_calls              = %10lu\n", tx_calls);
@@ -80,6 +81,9 @@ int main(int argc, char **argv)
         IDOS->Printf("    cook               = %10lu (%2lu%%)\n",
                      tx_cook / tx_calls,
                      tx_total ? (100UL * tx_cook / tx_total) : 0);
+        IDOS->Printf("      of which hook    = %10lu (%2lu%% of cook)\n",
+                     tx_hook / tx_calls,
+                     tx_cook ? (100UL * tx_hook / tx_cook) : 0);
         IDOS->Printf("    flush              = %10lu (%2lu%%)\n",
                      tx_flush / tx_calls,
                      tx_total ? (100UL * tx_flush / tx_total) : 0);

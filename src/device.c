@@ -2365,24 +2365,30 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
             ioreq->ios2_Req.io_Error = IOERR_BADLENGTH;
             break;
         }
-        ULONG v[10];
-        v[0] = devBase->prof_tx_calls;
-        v[1] = devBase->prof_tx_c_total;
-        v[2] = devBase->prof_tx_c_cook;
-        v[3] = devBase->prof_tx_c_flush;
-        v[4] = devBase->prof_tx_c_ring;
-        v[5] = devBase->prof_tx_c_notify;
-        v[6] = devBase->prof_rx_calls;
-        v[7] = devBase->prof_rx_pkts;
-        v[8] = devBase->prof_rx_c_total;
-        v[9] = devBase->prof_rx_c_hook;
-        for (int i = 0; i < 10; i++) {
+        UWORD nfields = 11;
+        if (ioreq->ios2_DataLength < nfields * 4) {
+            ioreq->ios2_Req.io_Error = IOERR_BADLENGTH;
+            break;
+        }
+        ULONG v[11];
+        v[0]  = devBase->prof_tx_calls;
+        v[1]  = devBase->prof_tx_c_total;
+        v[2]  = devBase->prof_tx_c_cook;
+        v[3]  = devBase->prof_tx_c_flush;
+        v[4]  = devBase->prof_tx_c_ring;
+        v[5]  = devBase->prof_tx_c_notify;
+        v[6]  = devBase->prof_rx_calls;
+        v[7]  = devBase->prof_rx_pkts;
+        v[8]  = devBase->prof_rx_c_total;
+        v[9]  = devBase->prof_rx_c_hook;
+        v[10] = devBase->prof_tx_c_hook;
+        for (int i = 0; i < nfields; i++) {
             out[i*4 + 0] = (UBYTE)(v[i] >> 24);
             out[i*4 + 1] = (UBYTE)(v[i] >> 16);
             out[i*4 + 2] = (UBYTE)(v[i] >>  8);
             out[i*4 + 3] = (UBYTE)(v[i]      );
         }
-        ioreq->ios2_DataLength = 40;
+        ioreq->ios2_DataLength = nfields * 4;
         break;
     }
 
@@ -2673,7 +2679,9 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
             uint16 etype = (uint16)(ioreq->ios2_PacketType & 0xFFFF);
             eth[12] = (UBYTE)(etype >> 8);
             eth[13] = (UBYTE)(etype & 0xFF);
+            uint32 _pt_hook_start = vn_tb();
             BOOL ok = vn_invoke_copy_from(devBase, op, ioreq, eth + 14, len);
+            devBase->prof_tx_c_hook += (vn_tb() - _pt_hook_start);
             if (!ok) {
                 ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
                 ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;

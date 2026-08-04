@@ -225,6 +225,7 @@ struct VirtnetBase
     volatile ULONG      prof_tx_c_flush;    /* dcbf loop over payload */
     volatile ULONG      prof_tx_c_ring;     /* desc fill + avail push + barriers */
     volatile ULONG      prof_tx_c_notify;   /* MMIO write to QUEUE_NOTIFY */
+    volatile ULONG      prof_tx_c_hook;     /* CallHookPkt for CopyFromBuff (sub-slice of cook) */
     volatile ULONG      prof_rx_calls;      /* # vn_process_rx invocations */
     volatile ULONG      prof_rx_pkts;       /* # frames delivered via hook */
     volatile ULONG      prof_rx_c_total;    /* total cycles in vn_process_rx */
