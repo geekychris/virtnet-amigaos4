@@ -502,7 +502,10 @@ static inline void   e1000_write32(volatile void *base, uint32 off, uint32 val);
  * long as Roadshow can't queue >32 TX requests faster than QEMU
  * drains them, no in-flight buffer gets overwritten. */
 #define VN_TX_SLOT_SIZE   2048UL
-#define VN_TX_POOL_SLOTS  32UL
+/* One pool slot per descriptor — pool_slot = desc_slot directly, no
+ * wrap-back race even if Roadshow's dispatch storm drains the whole
+ * ring before QEMU processes anything. 256 × 2KB = 512KB total. */
+#define VN_TX_POOL_SLOTS  256UL
 
 /* SANA-II Rev 4 has two CopyTo/CopyFromBuff ABIs. The classic tag
  * S2_CopyToBuff / S2_CopyFromBuff points at a m68k asm function that
@@ -2505,7 +2508,10 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
         uint16 tx_avail_now = vio_le16_get(
             (uint16 *)(((UBYTE *)devBase->tx_vring) + VRING_AVAIL_OFFSET(tx_num_early) + 2));
         UWORD desc_slot = (UWORD)(tx_avail_now % tx_num_early);
-        UWORD pool_slot = (UWORD)(desc_slot & (VN_TX_POOL_SLOTS - 1));
+        /* VN_TX_POOL_SLOTS == tx_vring_num (256), so pool_slot maps
+         * 1:1 to desc_slot — no wrap-back race regardless of
+         * Roadshow's burst rate vs QEMU's drain rate. */
+        UWORD pool_slot = (UWORD)(desc_slot % VN_TX_POOL_SLOTS);
         UBYTE *dst = (UBYTE *)devBase->tx_pool + pool_slot * VN_TX_SLOT_SIZE;
         uint32 live_phys = devBase->tx_pool_phys + pool_slot * VN_TX_SLOT_SIZE;
 
