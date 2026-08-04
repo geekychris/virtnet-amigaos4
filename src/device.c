@@ -714,24 +714,38 @@ static uint32 vn_isr(struct ExceptionContext *ctx,
     struct VirtnetBase *base = (struct VirtnetBase *)is_Data;
     (void)ctx; (void)sysbase;
 
+    /* DIAGNOSTIC: increment every entry regardless of ISR value so we
+     * can tell "ISR never runs" (task_wake_count stays 0) vs "ISR runs
+     * but VIRTIO_PCI_ISR reads 0 every time" (task_wake_count grows
+     * but irq_counter stays 0). Repurpose task_wake_count for this
+     * count temporarily. */
+    base->task_wake_count++;
+
     /* virtio legacy: read VIRTIO_PCI_ISR. It's read-to-clear.
-     * bit 0 = queue-used advanced, bit 1 = config changed. If both
-     * zero, this IRQ isn't for us (shared INTx). */
+     * bit 0 = queue-used advanced, bit 1 = config changed.
+     *
+     * Phase 12b: on this QEMU sam460ex / virtio-net-pci-legacy combo
+     * the ISR register READS 0 every time even though QEMU fires
+     * IRQ (we recorded 52 ISR entries with irq_counter=0 = "we
+     * ran but saw 0"). Root cause unknown — QEMU may clear the
+     * bit before delivery, or the read may hit a race, or the
+     * INTx line is being delivered before ISR bit is set.
+     *
+     * Since our ISR being called at all is enough evidence a
+     * queue event happened (we're the ONLY device on this vector
+     * per MapInterrupt), unconditionally signal the unit task.
+     * Cost: unit task wakes on unrelated shared-INT storms too,
+     * but vn_process_rx is idempotent (returns early if used ring
+     * didn't advance) so worst case is wasted wake-ups. */
     if (!base->io_base) return 0;
     UBYTE isr = base->pciDevice->InByte(base->io_base + VIRTIO_PCI_ISR);
-    if (isr == 0) return 0;
-
     base->irq_counter++;
     base->last_icr = (uint32)isr;   /* reuse existing DBG field for compat */
 
-    /* On queue interrupt, wake unit task to drain used ring.
-     * Ring walking is not ISR-safe (Alloc/semaphore/etc.). */
-    if ((isr & VIRTIO_ISR_QUEUE) && base->unit_task && base->unit_signal_mask) {
+    if (base->unit_task && base->unit_signal_mask) {
         struct ExecIFace *IExec = base->IExec;
         IExec->Signal(base->unit_task, base->unit_signal_mask);
     }
-    /* VIRTIO_ISR_CONFIG (bit 1) would fire on link-status change
-     * etc. — nothing consumes it yet, so just log via last_icr. */
     return 1;
 }
 
