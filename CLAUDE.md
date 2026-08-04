@@ -1,16 +1,33 @@
-# virte1000 — Claude project instructions
+# virtnet — Claude project instructions
 
-Intel e1000 SANA-II network driver for AmigaOS 4.1 PPC under QEMU
-sam460ex. Sibling to `amiga_mcp` and `python-amigaos4`.
+virtio-net SANA-II driver for AmigaOS 4.1 PPC under QEMU sam460ex.
+Sibling to `amiga_mcp`, `virte1000` (e1000 driver), `python-amigaos4`.
+Repo evolved from a fork of `virte1000` — much of the SANA-II layer,
+tests, build system, and design doc are shared.
+
+## Current status (2026-08)
+
+Working end-to-end. `virtnet.device` deployed to `DEVS:Networks/`,
+Roadshow binds interface `192.168.101.15` on subnet `101.0/24`,
+ARP + TCP + sustained data all confirmed. Perf: **25 Mbit/s
+sustained, 0 retransmissions**. Baseline `virte1000` is ~40 Mbit/s
+on the same host — ~35 % gap is the current optimization target.
+
+See `docs/PROGRESS.md` for the fix trail.
 
 ## What "done" looks like
 
-`virte1000.device` file installed to `SYS:Kickstart/` on the OS4
-guest, added to `Kicklayout` and `diskboot.config`, replaces or
-coexists with the rtl8139 rebroadcaster the guest currently uses.
-`bsdsocket.library` binds it. Standard OS4 network tools
-(`ping`, browsing the web, `roadshow` config) work through it.
-Iperf-equivalent throughput measurably higher than rtl8139.
+Roadshow binding + reliable TCP is done. Remaining "polish" goals:
+
+- Match or exceed `virte1000` throughput (candidates:
+  VIRTIO_NET_F_CSUM, VIRTIO_RING_F_EVENT_IDX, RX refill batching).
+- Land in `SYS:Kickstart/` + `Kicklayout` so the driver auto-loads
+  at boot without depending on `DEVS:Networks/`. Only do this after
+  a few days of stability testing — a broken Kickstart driver
+  blocks the whole boot path.
+- Optional: modern virtio-net-pci (device 0x1041) support for
+  MSI-X + multi-queue. Legacy is fine for our current throughput
+  goals.
 
 ## Toolchain
 
@@ -100,6 +117,8 @@ Read these before writing code (via the Read tool on the paths):
 
 ## Gotchas already known
 
+### AmigaDOS + build
+
 - **AmigaDOS `;` is a comment**, not a statement separator. Never
   use it in `dos_command()` invocations.
 - **`<file`** as stdin redirect **does not work** in AmigaDOS for
@@ -109,10 +128,63 @@ Read these before writing code (via the Read tool on the paths):
   Set the clock with `date DD-MMM-YY HH:MM:SS` where the value is
   `real_UTC - TZ_offset`. Only matters for time-signed protocols
   (SigV4/JWT/OAuth).
-- **PPC is big-endian**; e1000 registers and descriptors are
-  **little-endian**. Wrap all descriptor accesses with byte-swap
-  primitives. Look for `stwbrx`/`lwbrx` inline asm patterns in
-  VirtualSCSIDevice.
+- **Resident-tag `.device` can't link newlib.** Any byte loop
+  ≥ ~20 bytes may get `-O2`-optimized to `memset()`/`memcpy()`
+  which unresolvably references `INewlib`. Wrap the destination
+  pointer in `volatile` (`volatile UBYTE *v = raw; for (i=0;...) v[i]=0;`)
+  to force the compiler to emit per-byte stores.
+
+### Virtio + PPC BE traps (this driver's specialty)
+
+- **QEMU 11 legacy virtio-net-pci on sam460ex reads ring memory as
+  BE-native** (`info virtio-status` reports `endianness: big`).
+  Do NOT byte-swap with `stwbrx`/`sthbrx` for ring accesses.
+  Plain `*p = val` is correct.
+- **`vring_desc.addr` is one 64-bit field.** If you split it into
+  `uint32 addr_lo; uint32 addr_hi;` on a 32-bit BE guest, `addr_hi`
+  MUST come first — otherwise the BE 64-bit load QEMU performs
+  puts your low half in the high 32 bits. Everything then decodes
+  as `0x<phys>_00000000`, way past guest RAM, and QEMU silently
+  reads zero payloads.
+- **MMIO to BAR0 I/O ports** (STATUS, ISR, QUEUE_NOTIFY, …) still
+  needs LE byte-swap because that's PCI I/O convention. Use
+  `IPCI->InLong/OutLong` — they byte-swap for you. Do NOT confuse
+  MMIO byte-swap with ring byte-swap; they're different layers.
+- **Every `CMD_WRITE` needs its own scratch buffer.** A single
+  shared `tx_scratch2` will get overwritten by the next
+  `CMD_WRITE` while QEMU is still DMA-reading the previous one.
+  Symptom: sporadic packet corruption every ~3-4 packets in pcap,
+  TCP retransmission storms, eventual server RST. Use a per-slot
+  pool (`tx_pool[desc_slot]`) with 256 slots × 2 KB.
+- **QEMU device `broken: true` latches on bogus descriptors.**
+  Once QEMU sees an invalid descriptor, the whole device stops
+  processing until QEMU restart. Any test after that latch is
+  meaningless. Check `info virtio-status` for `broken:` state
+  before believing "TX doesn't work."
+- **Roadshow only recognizes an interface if `S2_DEVICEQUERY`
+  reports a valid `HardwareType`.** Our handler's `supply` param
+  gates which fields get written; if it caps at 24 bytes, the
+  `HardwareType` at pack(2) offset 26 is never written and
+  `ShowNetStatus` reports `Type=Unknown (0)`. Use supply=34
+  to cover the full pack(2) struct through `RawMTU`.
+
+### Diagnosis first, code second
+
+The fastest debug loop for ring-visibility problems is the QEMU
+monitor — see `docs/DEBUGGING.md`. Before adding any
+instrumentation to the driver itself:
+
+1. `info virtio-status` — confirm `broken: false` and
+   `endianness: big`.
+2. `info virtio-queue-status <path> <q>` — check whether
+   `shadow_avail_idx` matches what your driver wrote.
+3. `info virtio-queue-element <path> <q> 0` — decode a descriptor
+   and read the `addr` field. Compare against your intended
+   buffer's phys.
+4. `xp /Nbx <addr>` — dump the actual bytes at any guest phys.
+
+Almost every virtio bug we've hit shows up cleanly in one of these
+four commands.
 
 ## What NOT to touch
 
@@ -120,5 +192,9 @@ Read these before writing code (via the Read tool on the paths):
   when you need to add MCP tool support you're missing (rare).
 - `python-amigaos4/` — completely orthogonal. Don't drag it in.
 - Guest-side `SYS:Kickstart/` files — that's how OS4 boots.
-  Test drivers as loadable `.device`s from `DH1:` first; only
-  install to Kickstart when stable.
+  Test drivers as loadable `.device`s from `DH1:` or
+  `DEVS:Networks/` first; only install to Kickstart when the
+  driver has been stable for days.
+- `docs/DESIGN.md` §§ 1-6 — those are the pre-implementation
+  e1000 design and don't reflect what virtnet actually ships.
+  Update `PROGRESS.md` and `VIRTIO_PROTOCOL.md` instead.

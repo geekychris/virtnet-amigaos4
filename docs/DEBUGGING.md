@@ -1,6 +1,34 @@
-# virte1000 debugging techniques + tools
+# virtnet debugging techniques + tools
 
 Living document. Update as new techniques land.
+
+## When to reach for which tool
+
+```mermaid
+flowchart TD
+    A[Driver misbehaves] --> B{Does init log look sane?}
+    B -- No --> C[Read RAM:virtnet-init.log<br/>fix Init failures]
+    B -- Yes --> D{Roadshow calls CMD_WRITE?}
+    D -- No --> E[ShowNetStatus INTERFACES ROUTES<br/>check Type=Ethernet, connected route]
+    D -- Yes --> F{Packets on n2 pcap?}
+    F -- No --> G[QEMU monitor:<br/>info virtio-status<br/>info virtio-queue-status]
+    F -- All zeros --> H[QEMU monitor:<br/>info virtio-queue-element<br/>+ xp physical-addr]
+    F -- Real content --> I{Sustained data flow?}
+    I -- No / RSTs --> J[tcpdump for retrans pattern<br/>→ TX buffer race?]
+    I -- Yes --> K[Perf regression?<br/>compare vs Bill's virte1000]
+```
+
+Rules of thumb:
+- **QEMU monitor commands** (info virtio-*, xp) are the single most
+  powerful debug tool for virtio ring problems. Everything else is
+  guesswork; monitor is ground truth of what the device sees.
+- **`filter-dump` pcap** on the netdev is the source of truth for
+  "what actually hit the wire." Trust it over any driver-side log.
+- Always **restart QEMU** between virtio experiments — a "bogus
+  descriptor" error latches `broken: true` on the device and nothing
+  processes until you reset.
+- Always **reboot the guest** after a `virtnet.device` swap — the
+  library base is cached even when you `avail flush`.
 
 ## Tools inventory
 
@@ -130,6 +158,119 @@ curl -s -X POST http://localhost:3000/api/hostkey \
 ```
 Needed `cliclick` (from `brew install cliclick`). AppleScript's
 `keystroke` mangles Shift; cliclick handles it correctly.
+
+### QEMU monitor over TCP — virtio ring inspection
+
+The single most valuable virtnet-debug tool. The `amiga_mcp` launcher
+opens QEMU's monitor on `tcp::2348,server,nowait`. From the host:
+
+```python
+import socket, time, re
+s = socket.create_connection(('127.0.0.1', 2348), timeout=5)
+time.sleep(0.5); s.recv(4096)   # banner
+
+def cmd(c):
+    s.send((c+'\n').encode()); time.sleep(0.8)
+    buf = b''
+    while True:
+        chunk = s.recv(16384)
+        if not chunk: break
+        buf += chunk
+        if b'(qemu)' in buf: break
+    return re.sub(r'\x1b\[[KD]', '', buf.decode(errors='replace'))
+```
+
+The **five commands** you'll run over and over:
+
+| Purpose | Command |
+|---|---|
+| Confirm device broken / endianness | `info virtio-status <path>` |
+| See per-queue avail-idx / used-idx | `info virtio-queue-status <path> <q>` |
+| Decode a single ring entry | `info virtio-queue-element <path> <q> <idx>` |
+| Peek arbitrary guest phys RAM | `xp /Nbx <phys-addr>` |
+| List PCI devices + BARs | `info pci` |
+
+`<path>` for our virtio-net-pci on the standard launcher is
+`/machine/peripheral-anon/device[2]/virtio-backend`.
+
+**Interpreting `info virtio-status`:**
+
+- `endianness: big` → ring memory must be BE-native. If your driver
+  is writing byteswapped-LE (via `stwbrx`), stop and switch to plain
+  `*p = val`.
+- `broken: true` → device latched into failure mode by a bogus
+  descriptor. Nothing will process until QEMU is restarted. Any
+  subsequent test result is meaningless.
+- `queue_sel: <n>` → whichever queue was last written to
+  VIRTIO_PCI_QUEUE_SEL. Use as a sanity check that your driver's
+  init sequence set what you thought it did.
+
+**Interpreting `info virtio-queue-status <path> <q>`:**
+
+```
+inuse:            0        ← descriptors QEMU is currently processing
+used_idx:         0        ← QEMU's own idx cursor for used ring writes
+last_avail_idx:  N         ← how many avail entries QEMU has consumed
+shadow_avail_idx: N        ← QEMU's cached view of driver's avail->idx
+```
+
+If `shadow_avail_idx == 0` but you know you wrote N avail entries,
+QEMU can't read your ring at that address — check `endianness`, then
+check that the PFN you wrote actually maps to the phys addr you
+think.
+
+If `shadow_avail_idx` shows values that match a *different* queue's
+data (e.g. queue 1 shows a value matching your RX populate count),
+you have a queue-index bug: our `vring_desc.addr` field-order trap
+(commit `e01eae5`) presented this way, because QEMU's decoded
+descriptor pointed at nonsense high-half addresses that happened to
+look like our RX ring's contents.
+
+**Interpreting `info virtio-queue-element <path> <q> <idx>`:**
+
+Returns QEMU's decoded view of the descriptor at `avail_ring[idx]`.
+The most useful field is `addr <hex>`. Compare against what your
+driver's `IMMU->GetPhysicalAddress(cpu_ptr)` returned at Init time
+for the buffer that descriptor points to. If they don't match:
+
+- Ring endianness is wrong, OR
+- `vring_desc` field order is wrong for a BE 64-bit read, OR
+- Your PCI DMA mapping (`StartDMA` / `GetDMAList`) returned a
+  different phys than the CPU view (rare on sam460ex — verify
+  with `info mtree -f` — both AS "memory" and AS "pci-bm" should
+  contain the same `ppc4xx.sdram` mapping).
+
+**`xp /Nbx <addr>` for direct RAM peeking:**
+
+```
+(qemu) xp /48bx 0x3F33C000
+3f33c000: 0x00 0x00 0x00 0x00 0x3f 0x33 0xe8 0x20   ← desc[0].addr_hi/lo
+3f33c008: 0x00 0x00 0x00 0x46 0x00 0x00 0x00 0x00   ← desc[0].len/flags/next
+```
+
+Bytes 0..3 all zero + bytes 4..7 = `0x3F33E820` means our
+`addr_hi=0, addr_lo=0x3F33E820` write landed correctly for a
+BE-64 read.
+
+### QEMU tracing to file
+
+Add to `start-qemu-os4.sh` (already committed in `amiga_mcp/91bea2a`):
+
+```
+-trace virtio_queue_notify \
+-trace virtqueue_pop \
+-trace virtqueue_alloc_element \
+-trace virtqueue_fill \
+-trace virtqueue_flush \
+-trace 'virtio_notify*' \
+-trace 'virtio_pci_*' \
+--trace file=/tmp/qemu-trace.log
+```
+
+`virtio_queue_notify` fires on every doorbell (guest → QEMU).
+`virtqueue_pop` fires when QEMU actually pulls a descriptor. If
+you see notify with no matching pop, your avail ring content isn't
+readable by QEMU — go to `info virtio-queue-element` for the decode.
 
 ---
 

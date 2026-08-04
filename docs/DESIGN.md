@@ -1,4 +1,34 @@
-# virte1000 design
+# virtnet design (evolved from virte1000)
+
+> **Provenance note.** This document was originally written as the
+> pre-implementation design for the sibling **`virte1000`** e1000
+> driver, and was forked into this repo as the starting point for
+> `virtnet`. Sections 2–6 (register subset, init sequence, RX/TX,
+> IRQ) describe the **e1000** programming model and are only
+> historically relevant here — the virtio-net driver replaces
+> essentially all of that.
+>
+> The parts that remain directly applicable to virtnet are:
+> - **§7 Endian strategy** — same `lwbrx`/`stwbrx` primitives, same
+>   `eieio` vs `mbar` rationale — but see the **Addendum** at the
+>   bottom for the virtio-specific twist (BE-native ring, and
+>   `vring_desc.addr` field ordering that was only nailed down at
+>   Phase 13).
+> - **§8 Memory allocation for DMA** — flags, alignment,
+>   `StartDMA` / `GetDMAList` — all still current, plus a new
+>   twist for the per-slot TX pool.
+> - **§9 SANA-II command dispatch** — inherited by virtnet in one
+>   piece; the dispatch layer works identically.
+> - **§10 CopyFromBuff / CopyToBuff semantics** — unchanged.
+> - **§11 Test harness plan** — unchanged.
+>
+> For what actually shipped in `virtnet`, read
+> [PROGRESS.md](PROGRESS.md) (timeline) and
+> [VIRTIO_PROTOCOL.md](VIRTIO_PROTOCOL.md) (protocol reference)
+> first. Come back here for background on the SANA-II boundary and
+> DMA memory choices.
+
+---
 
 Intel e1000 (`E1000_DEV_ID_82540EM` = 0x100E, vendor 0x8086) SANA-II
 network driver for AmigaOS 4.1 PPC under QEMU sam460ex.
@@ -1142,3 +1172,173 @@ section.
    respond to the standard SANA-II commands. Roadshow does the rest.
    Confirm with a `roadshow` config once the driver hits stage 4 of
    the test plan.
+
+---
+
+## Addendum A: virtnet-specific design corrections (Phase 13)
+
+This section supersedes assumptions in §7 (endian) and §8 (DMA)
+that turned out to be wrong or incomplete for the virtio-net driver
+running against QEMU 11 on sam460ex.
+
+### A.1 Ring endianness is BE-native, not byte-swapped LE
+
+Original claim in §7.3 (inherited from the e1000 design): "descriptor
+fields need byte-swap on read and write" using `stwbrx`/`sthbrx`.
+That's correct for **e1000** (whose descriptor format is defined LE).
+It's **wrong for virtio-net-pci-legacy** — legacy virtio uses
+**guest-native endianness** for virtqueue memory, and QEMU's
+`info virtio-status` confirms it as `endianness: big` for our target.
+
+Correct virtio ring accessors:
+
+```c
+static inline uint16 vio_le16_get(uint16 *p)       { return *p; }
+static inline void   vio_le16_put(uint16 *p, u16 v) { *p = v; }
+static inline uint32 vio_le32_get(uint32 *p)       { return *p; }
+static inline void   vio_le32_put(uint32 *p, u32 v) { *p = v; }
+```
+
+The `_le_` name is retained because it's an internal convention; the
+functions themselves are BE-native. See commit `e01eae5` and
+`include/virtio.h` current content.
+
+**MMIO accesses to the BAR0 I/O port** (STATUS, ISR, QUEUE_NOTIFY,
+etc.) still go through the OS4 `IPCI->InLong/InWord/OutLong/OutWord`
+methods and DO get PCI-standard LE byte-swap. Different layer, different
+rule.
+
+### A.2 `vring_desc.addr` is a single 64-bit field
+
+The spec defines `vring_desc.addr` as `__virtio64` — one 64-bit
+value, not two 32-bit halves. When you split it into `uint32 addr_lo;
+uint32 addr_hi;` for a 32-bit guest's convenience, the **field order
+matters** on a BE host: `addr_hi` must come first, so that the 64-bit
+BE load QEMU performs reconstructs the low 32 bits from bytes 4..7
+where you actually wrote them.
+
+Full byte layout QEMU expects for one descriptor:
+
+```mermaid
+block-beta
+    columns 4
+    block:d1["offset 0..7 — addr (64-bit BE)"]:4
+      space:4
+    end
+    block:d2["addr_hi (bytes 0..3, MSW)"]:2
+      space:2
+    end
+    block:d3["addr_lo (bytes 4..7, LSW)"]:2
+      space:2
+    end
+
+    block:d4["offset 8..11 — len (32-bit BE)"]:2
+      space:2
+    end
+    block:d5["offset 12..13 — flags (16-bit)"]:1
+      space:1
+    end
+    block:d6["offset 14..15 — next (16-bit)"]:1
+      space:1
+    end
+```
+
+Detected via `info virtio-queue-element` showing `addr` decoded as
+`0x3F33E82000000000` when we wrote a low-half of `0x3F33E820` — a
+tell for "you put the low word in the high half."
+
+### A.3 Per-slot TX scratch pool replaces single tx_scratch2
+
+The pre-implementation §5 assumed one TX bounce buffer served all
+`CMD_WRITE`s, with a completion poll before reuse. The poll turned
+out to be a correctness gate rather than an optimization: on a
+timeout, the next `CMD_WRITE` scribbles fresh data over an
+in-flight payload. Symptom: pcap-visible packet loss every ~3-4
+packets, then TCP retransmission storms, then server RST.
+
+Current TX path allocates one 2 KB buffer per descriptor slot
+(256 × 2 KB = 512 KB pool, separately `AllocMem`'d) and indexes
+`pool[desc_slot]` in `CMD_WRITE`. The completion poll is dropped
+entirely: reply-and-forget after the notify. Each in-flight
+descriptor carries its own buffer, so a race is structurally
+impossible.
+
+Layout in memory:
+
+```mermaid
+block-beta
+    columns 3
+    block:vring["tx_vring (CACHEINHIBIT)"]:1
+      d["desc[0..255]<br/>16 B each<br/>= 4 KB"]
+      a["avail<br/>flags+idx+ring[256]<br/>+ pad to 4KB"]
+      u["used<br/>flags+idx+ring[256]"]
+    end
+    block:pool["tx_pool (cached, dcbf-flushed)"]:1
+      p0["slot 0<br/>2 KB"]
+      p1["slot 1<br/>2 KB"]
+      pn["… 256 slots<br/>512 KB total"]
+    end
+    block:bufs["rx_bufs (cached, dcbi-invalidated)"]:1
+      r0["slot 0<br/>2 KB"]
+      r1["slot 1<br/>2 KB"]
+      rn["… 256 slots<br/>512 KB total"]
+    end
+```
+
+Choice of `CACHEINHIBIT` for the vring but plain-cached for
+`tx_pool` / `rx_bufs`:
+
+- Vring is small (16 KB total) and traffic on it is
+  read-and-write-of-single-16-bit-idx-fields → cache would give
+  minimal benefit and every access is precisely the sort of thing
+  where you don't want a stale cacheline gap between guest write
+  and hypervisor read. `CACHEINHIBIT` removes the whole class of
+  bugs at the cost of maybe 100 ns per idx update.
+- TX/RX buffer pools carry 1500-byte payloads → the memcpy is 47
+  cachelines and benefits enormously from caching. Keep them
+  cached and use `dcbf`-per-cacheline before each descriptor
+  push.
+
+### A.4 Descriptor-slot rotation vs QUEUE_NOTIFY
+
+Empirically: QEMU virtio-net on this build **won't re-process a
+descriptor slot that it's already popped once until `avail->idx`
+wraps back around to it in the natural order.** Reusing `desc[0]`
+for every TX (early prototype) silently ignored all TXs after the
+first, even after our used-ring reclaim. Rotating `desc_slot =
+avail_idx % num` on every `CMD_WRITE` fixed this and is the pattern
+now in use.
+
+This is called out in the QEMU spec as "the driver is expected to
+present each avail entry with a distinct descriptor index" but the
+consequence isn't obvious from the wording alone.
+
+---
+
+## Addendum B: perf numbers (Phase 13)
+
+Fresh QEMU boot, first perf test after a `reboot`. Numbers from
+`pyperf --raw` client on the guest, `pyperf --server` on the host,
+subnet `192.168.101.0/24` via SLIRP n2:
+
+| Duration | Bytes | Rate | Retrans |
+|---:|---:|---:|---:|
+|  5 s | 17.0 MB | 26.6 Mbit/s | 0 |
+| 10 s | 31.8 MB | 25.3 Mbit/s | 0 |
+| 15 s | 48.9 MB | 25.9 Mbit/s | 0 |
+
+Comparison: `virte1000` (Bill Borsari's e1000 driver, same
+sam460ex QEMU host, same iperf3 harness) reaches ~40 Mbit/s on a
+fresh boot. Virtnet is ~35 % behind that.
+
+Candidate levers for closing the gap, in expected order of impact:
+
+1. **VIRTIO_NET_F_CSUM** — negotiate TCP checksum offload; guest
+   skips checksum work per segment.
+2. **VIRTIO_RING_F_EVENT_IDX** — driver hints QEMU to only interrupt
+   when `used_idx` reaches a specific value, avoiding wakeup storms.
+3. **RX descriptor refill batching** — currently we push each
+   refilled descriptor with its own `avail->idx++`; batching them
+   halves the barrier count.
+4. **Larger MTU** — if the host supports it, jumbo frames (9000 B)
+   would slash per-packet CPU. Not applicable to SLIRP.

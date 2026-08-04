@@ -131,6 +131,82 @@ fields are stored BE. Writing `avail->ring[i] = desc_idx` from C
 just does a normal `stw` and the hypervisor reads it BE-correctly.
 No byte-swap.
 
+You can verify this on any live QEMU with:
+
+```
+$ python3 -c "import socket; s=socket.create_connection(('127.0.0.1',2348));
+   s.send(b'info virtio-status /machine/peripheral-anon/device[2]/virtio-backend\n');
+   import time; time.sleep(1); print(s.recv(8192).decode())"
+...
+  endianness:              big
+```
+
+(This project's `-monitor tcp::2348,server,nowait` is set in the
+`amiga_mcp` QEMU launch script.) If you see `little` there, your
+target isn't sam460ex-PPC-BE — adjust accordingly.
+
+### The `vring_desc.addr` field-order trap
+
+The spec defines:
+
+```c
+struct vring_desc {
+    __virtio64 addr;   /* 64-bit buffer physical address */
+    __virtio32 len;
+    __virtio16 flags;
+    __virtio16 next;
+};
+```
+
+`addr` is **one 64-bit field**, not two 32-bit halves. QEMU reads it
+as a single BE 64-bit load on the sam460ex target. If your struct
+splits it into two `uint32_t` fields for the low- and high-halves
+(which is what you want on a 32-bit guest, since you're only writing
+the low half meaningfully), **`addr_hi` must come first**:
+
+```c
+struct vring_desc {
+    uint32 addr_hi;    /* bytes 0..3 = HIGH half of the 64-bit addr */
+    uint32 addr_lo;    /* bytes 4..7 = LOW half */
+    uint32 len;
+    uint16 flags;
+    uint16 next;
+};
+```
+
+If you write `addr_lo` first (the intuitive C ordering), on BE PPC
+your `addr_lo = 0x3F33E820` lands in bytes 0..3 as `3F 33 E8 20`,
+QEMU reads the whole 64-bit `addr` as BE `0x3F33E820_00000000` — way
+past guest RAM — and every descriptor silently reads zeros. Pcap
+shows all-zero frames. See commit `e01eae5` for the story.
+
+Diagram of the memory layout QEMU expects:
+
+```mermaid
+block-beta
+    columns 8
+    block:bytes01["bytes 0..3"]:4
+      space:4
+    end
+    block:bytes47["bytes 4..7"]:4
+      space:4
+    end
+    b0["byte 0"] b1["byte 1"] b2["byte 2"] b3["byte 3"] b4["byte 4"] b5["byte 5"] b6["byte 6"] b7["byte 7"]
+    d0["0x00"] d1["0x00"] d2["0x00"] d3["0x00"] d4["0x3F"] d5["0x33"] d6["0xE8"] d7["0x20"]
+    style d0 fill:#fdd
+    style d1 fill:#fdd
+    style d2 fill:#fdd
+    style d3 fill:#fdd
+    style d4 fill:#dfd
+    style d5 fill:#dfd
+    style d6 fill:#dfd
+    style d7 fill:#dfd
+```
+
+Left half (bytes 0..3, red) = `addr_hi` = 0. Right half (bytes 4..7,
+green) = `addr_lo` = `0x3F33E820`. QEMU's BE 64-bit load reconstructs
+`addr = 0x0000_0000_3F33_E820` — the actual buffer address.
+
 The **device-specific config region** (BAR0 offset 0x14+) is also
 guest-native. Standard I/O port registers are LE (PCI convention),
 and `IPCI->InLong/InWord` on OS4 handle that for you. But
@@ -143,22 +219,45 @@ bytes=00,01 link=0001 (UP)` log line for the empirical confirmation.
 
 When the driver has a packet to send:
 
-1. Fill in a `virtio_net_hdr` (10 bytes for our feature set — no
-   MRG_RXBUF negotiated) followed by the raw Ethernet frame in a
-   guest-owned buffer.
-2. Grab the next free descriptor index `d`; fill `desc[d]` with the
-   buffer's physical address, length, and `flags = 0` (single-buffer,
-   device-read).
-3. Write `avail->ring[avail->idx % num] = d`.
-4. **Memory barrier** (make sure the ring write is globally visible
-   before the idx bump).
-5. `avail->idx++`.
-6. **Memory barrier**.
-7. Write `QUEUE_NOTIFY = tx_queue_index` (this is the doorbell).
+1. Pick a slot `d = avail->idx % num`, i.e. the next descriptor slot.
+   Because our TX buffer pool has one entry per descriptor
+   (`VN_TX_POOL_SLOTS == tx_vring_num == 256`), we also index
+   `pool[d]` and cook the frame there — no separate buffer-slot
+   bookkeeping needed.
+2. Fill in a `virtio_net_hdr` (10 bytes for our feature set — no
+   MRG_RXBUF negotiated) followed by the raw Ethernet frame in
+   `pool[d]`.
+3. Fill `desc[d]` with the buffer's physical address, length, and
+   `flags = 0` (single-buffer, device-read). Under CACHEINHIBIT the
+   descriptor write is directly visible to QEMU; the payload buffer
+   (which is cached-normal memory) needs an explicit
+   `dcbf`-per-cacheline flush + `sync`.
+4. Write `avail->ring[avail->idx % num] = d`.
+5. **Memory barrier** (`eieio; sync`) to make sure the ring write is
+   globally visible before the idx bump.
+6. `avail->idx++`.
+7. **Memory barrier**.
+8. Write `QUEUE_NOTIFY = tx_queue_index` (this is the doorbell).
+9. Reply to Roadshow **immediately**. Do NOT poll for completion —
+   with per-slot buffers there's no reuse race, and dropping the
+   poll shaves 5-50 µs off every `CMD_WRITE`.
 
 The device processes it, DMAs the buffer, and writes an entry into
-the used ring pointing back at `d`. The driver's RX handler (usually
-the same IRQ) sees `used->idx` has advanced and reclaims `d` as free.
+the used ring pointing back at `d`. Our IRQ handler sees `used->idx`
+has advanced and reclaims `d` as free — but this is bookkeeping only;
+correctness doesn't depend on reclamation being fast.
+
+**Why per-slot buffers matter.** An earlier version of this driver
+used a single `tx_scratch2` buffer for every TX and polled the used
+ring before allowing the next `CMD_WRITE` to reuse it. That poll
+turned out to be a critical correctness gate rather than an
+optimization: when it timed out (10000 iter, ~10 ms) with QEMU still
+DMA-reading, the next `CMD_WRITE` scribbled fresh bytes over the
+in-flight payload and pushed a hybrid frame on the wire.
+Symptom in pcap: every ~3-4 packets, one had corrupt content →
+TCP loss recovery → server RST after ~40 KB. Fix was to give each
+in-flight descriptor its own buffer (256 × 2 KB = 512 KB pool) so
+the race is structurally impossible.
 
 ## The RX path
 

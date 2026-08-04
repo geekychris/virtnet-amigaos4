@@ -49,12 +49,66 @@ should be your default network path.
 
 ## Status
 
-**Work in progress.** As of this commit the driver reaches
-`DRIVER_OK` in the virtio init handshake — device found, reset,
-features negotiated, MAC + link status read — but virtqueue setup
-and packet TX/RX are not yet wired. See
-[docs/PROGRESS.md](docs/PROGRESS.md) for the phase-by-phase
-roadmap and current position.
+**Working end-to-end.** As of commit `97c4e6d`:
+
+- Full virtio init handshake through `DRIVER_OK`
+- Roadshow binds the interface, `ShowNetStatus` reports type `Ethernet`
+- ARP, TCP handshake, sustained TCP data flow all confirmed on the wire
+- **25.3 Mbit/sec** sustained (pyperf `--raw` to a host server, 10-15s
+  tests, fresh QEMU boot), **zero TCP retransmissions**
+- Comparison baseline: `virte1000` (Bill Borsari's e1000 driver on the
+  same sam460ex/QEMU) hits ~40 Mbit/sec — virtnet is currently ~35%
+  behind, tracked as a perf-tuning task
+
+Three non-obvious bugs unblocked this — all documented in
+[docs/PROGRESS.md](docs/PROGRESS.md) and
+[docs/VIRTIO_PROTOCOL.md](docs/VIRTIO_PROTOCOL.md):
+
+1. **QEMU 11 legacy virtio-net on BE PPC reads the ring as BE**
+   (its `info virtio-status` says `endianness: big`). The
+   Phase 10j byteswap-to-LE flip was wrong for this target.
+2. **`vring_desc.addr` must be laid out `addr_hi` first**, because
+   QEMU reads the whole 64-bit `addr` as a single BE 64-bit load.
+   `addr_lo` first put our 32-bit `addr_lo` in the *high* half of
+   the reconstructed 64-bit value → QEMU read our descriptors as
+   pointing at `0x3F33E820_00000000`, way past guest RAM, and
+   silently sent zero-content frames.
+3. **Per-slot TX scratch pool** (256 × 2 KB) — the earlier single
+   `tx_scratch2` buffer forced a completion poll before every reuse,
+   and when the poll timed out with QEMU still DMA-reading, the
+   next `CMD_WRITE` overwrote the payload mid-flight. Multi-slot
+   pool eliminated retransmissions entirely.
+
+## End-to-end packet flow
+
+```mermaid
+sequenceDiagram
+    participant App as Guest app<br/>(iperf3)
+    participant RS as Roadshow<br/>(bsdsocket)
+    participant Drv as virtnet.device<br/>(unit task)
+    participant Ring as tx_vring<br/>+ tx_pool
+    participant QEMU as QEMU<br/>virtio-net
+    participant Wire as SLIRP host
+
+    App->>RS: send(65536 bytes)
+    RS->>RS: segment into ~44 × 1460-byte TCP packets
+    loop per packet
+        RS->>Drv: SendIO(CMD_WRITE)
+        Drv->>Ring: cook frame into tx_pool[desc_slot % 256]
+        Drv->>Ring: fill desc[desc_slot]: addr_hi=0, addr_lo=phys, len
+        Drv->>Ring: dcbf/sync payload + descriptor + avail entry
+        Drv->>QEMU: I/O port write VIRTIO_PCI_QUEUE_NOTIFY=1
+        Drv->>RS: ReplyMsg (no completion poll — per-slot buffer is safe)
+        QEMU->>Ring: virtqueue_pop: read avail_ring, read desc
+        QEMU->>Wire: emit ethernet frame (strip virtio_net_hdr)
+        Wire->>QEMU: TCP ACK
+        QEMU->>Ring: DMA ACK into rx_pool[desc_idx] + write used ring
+        QEMU->>Drv: INTx IRQ
+        Drv->>Ring: vn_process_rx: walk used_ring, hand up
+        Drv->>RS: ReplyMsg for waiting CMD_READ
+        RS->>App: (window advances, send() unblocks)
+    end
+```
 
 ## Quick start
 
@@ -102,8 +156,9 @@ alongside your existing rtl8139 (for `amiga-bridge` comms).
 
 ## Roadshow config
 
-To have Roadshow bring the interface up at boot, drop a config in
-`DEVS:NetInterfaces/`:
+Drop this in `DEVS:NetInterfaces/virtnet` on the guest — Roadshow's
+`Network-Startup` will auto-add the interface at boot via
+`AddNetInterface QUIET DEVS:NetInterfaces/~(#?.info)`:
 
 ```
 DEVICE=DEVS:Networks/virtnet.device
@@ -112,13 +167,27 @@ ADDRESS=192.168.101.15
 NETMASK=255.255.255.0
 MTU=1500
 ID=virtnet
-DEBUG=YES
 IPREQUESTS=32
 WRITEREQUESTS=32
 ARPREQUESTS=32
+HARDWAREADDRESS=52:54:00:e1:00:02
 ```
 
-(Do this once packet TX/RX is wired — see status above.)
+`HARDWAREADDRESS` must match the MAC you pass QEMU (`mac=...` on
+`-device virtio-net-pci`), otherwise the default incrementing MAC
+QEMU hands out to your virtio device will collide with the one it
+gave your other NIC and Roadshow will silently filter one of them.
+
+After a fresh reboot, verify with:
+
+```
+ShowNetStatus INTERFACES ROUTES
+```
+
+You should see `virtnet 1500 Ethernet 192.168.101.15 ... Up` and,
+once traffic flows, a `192.168.101 192.168.101.15 Up` connected
+route. If `Type` reads `Unknown (0)`, the S2_DEVICEQUERY handler
+isn't writing the HardwareType field — see commit `6bf6277`.
 
 ## Repository layout
 
@@ -147,17 +216,33 @@ docs/
 
 ## Documentation
 
+- **[docs/PHASE13_NOTES.md](docs/PHASE13_NOTES.md)** — the three
+  fixes that unblocked TX on this driver, written for anyone
+  else porting virtio to a BE PPC guest. Mermaid diagrams,
+  code snippets, exact QEMU monitor commands.
+- **[docs/PROGRESS.md](docs/PROGRESS.md)** — phase-by-phase timeline
+  of what's landed, most-recent phase first.
 - **[docs/VIRTIO_PROTOCOL.md](docs/VIRTIO_PROTOCOL.md)** — virtio 0.9.5
-  legacy PCI transport explained, feature bits, queue mechanics, the
-  init handshake, and OS4/PPC-specific gotchas (endianness of the
-  device-config region, I/O port BAR access).
+  legacy PCI transport reference: feature bits, queue mechanics,
+  init handshake, and — critically for anyone porting virtio to a
+  BE guest — the endianness + `vring_desc.addr` traps this driver
+  hit.
+- **[docs/DEBUGGING.md](docs/DEBUGGING.md)** — tools + techniques,
+  including the QEMU monitor incantations
+  (`info virtio-status`, `info virtio-queue-status`,
+  `info virtio-queue-element`) that unblocked this session.
+- **[docs/DESIGN.md](docs/DESIGN.md)** — pre-implementation design
+  doc. Large (1144 lines), inherited from `virte1000`, and still
+  useful for the SANA-II layer and DMA-memory rationale, but the
+  code is the source of truth for what actually shipped.
+- **[docs/SANA-II-NOTES.md](docs/SANA-II-NOTES.md)** — Rev 7
+  implementer's notes: field-fits gates, DoIO vs SendIO, copy-hook
+  ABI, all the edge cases we hit at the SANA-II boundary.
 - **[docs/NEW_DRIVER_PLAYBOOK.md](docs/NEW_DRIVER_PLAYBOOK.md)** —
   how to reuse this codebase as a starting point for other virtio-*
   drivers on OS4 (virtio-blk, virtio-console, virtio-rng, etc.).
   The SANA-II layer is network-specific, but the virtio init +
   virtqueue mechanics are 90% reusable.
-- **[docs/PROGRESS.md](docs/PROGRESS.md)** — where we are on the
-  implementation, with what's proven live vs. what's still todo.
 
 ## License / contact
 
