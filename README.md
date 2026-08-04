@@ -220,6 +220,11 @@ docs/
   fixes that unblocked TX on this driver, written for anyone
   else porting virtio to a BE PPC guest. Mermaid diagrams,
   code snippets, exact QEMU monitor commands.
+- **[docs/PERF_JOURNEY.md](docs/PERF_JOURNEY.md)** — every perf
+  experiment tried this session with measurements, what worked
+  (per-slot TX pool, EVENT_IDX), what didn't (CSUM on SLIRP,
+  notify suppression, RX batching, hook bypass), and what to try
+  next.
 - **[docs/PROGRESS.md](docs/PROGRESS.md)** — phase-by-phase timeline
   of what's landed, most-recent phase first.
 - **[docs/VIRTIO_PROTOCOL.md](docs/VIRTIO_PROTOCOL.md)** — virtio 0.9.5
