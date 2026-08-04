@@ -544,10 +544,14 @@ static BOOL vn_invoke_copy_to(struct VirtnetBase *base,
     if (!op->copy_to_buff) return FALSE;
     base->last_copy_to_ptr = op->copy_to_buff;
     base->last_copy_to_tag = op->copy_to_tag;
-    if (op->copy_to_tag == S2_CopyToBuff) {
-        V1000CopyFn fn = (V1000CopyFn)op->copy_to_buff;
-        return fn(ioreq->ios2_Data, from, size);
-    }
+    /* Per Bill Borsari's fix on the sibling e1000 driver
+     * (amiga-e1000-driver c0fc9e7): ALWAYS invoke Copy* hooks via
+     * CallHookPkt, even when the "classic" S2_CopyToBuff tag is
+     * present. On OS4 Roadshow that tag ALSO points at a struct
+     * Hook*, not a raw fn ptr — calling it as a function jumps 8
+     * bytes into the Hook struct and writes garbage. Cross-driver
+     * proof: same fix took virte1000 from malformed payloads to
+     * valid IPv4 on the wire in one commit. */
     struct SANA2CopyHookMsg msg;
     msg.schm_Method  = op->copy_to_tag;
     msg.schm_MsgSize = sizeof(msg);
@@ -582,10 +586,9 @@ static BOOL vn_invoke_copy_from(struct VirtnetBase *base,
     if (!op->copy_from_buff) return FALSE;
     base->last_copy_from_ptr = op->copy_from_buff;
     base->last_copy_from_tag = op->copy_from_tag;
-    if (op->copy_from_tag == S2_CopyFromBuff) {
-        V1000CopyFn fn = (V1000CopyFn)op->copy_from_buff;
-        return fn(to, ioreq->ios2_Data, size);
-    }
+    /* Same fix as vn_invoke_copy_to — Bill Borsari's ALWAYS-CallHookPkt
+     * pattern from amiga-e1000-driver c0fc9e7. See that function's
+     * comment for the full rationale. */
     struct SANA2CopyHookMsg msg;
     msg.schm_Method  = op->copy_from_tag;
     msg.schm_MsgSize = sizeof(msg);
@@ -2347,9 +2350,30 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
         BOOL cooked = (op != NULL) && (devBase->IUtility != NULL) &&
                       (op->sana2_hook != NULL || op->copy_from_buff != NULL);
 
+        /* Roadshow's pre-ARP CMD_WRITE ships ios2_DstAddr = all zeros.
+         * QEMU (and any sensible switch) drops frames with dst=00:00:00:00:00:00
+         * silently — never hits our pcap. Bill's virte1000 fix used the
+         * "if dst is all zeros, treat as broadcast" heuristic: the frame
+         * becomes an Ethernet broadcast, which QEMU accepts and the SLIRP
+         * gateway ARPs back. Same fix, same rationale. */
+        BOOL dst_all_zero = TRUE;
+        for (int i = 0; i < 6; i++) {
+            if (ioreq->ios2_DstAddr[i]) { dst_all_zero = FALSE; break; }
+        }
+
         ULONG eth_len;
         if (cooked) {
-            for (int i = 0; i < 6; i++) eth[i]     = ioreq->ios2_DstAddr[i];
+            /* Written to `volatile` eth to defeat GCC's -O2 loop
+             * optimization that turns the 6-byte set into memset() —
+             * a resident-tag .device can't link against newlib's
+             * memset (INewlib is not resolved in this build). */
+            volatile UBYTE *veth = eth;
+            if (dst_all_zero) {
+                veth[0] = 0xFF; veth[1] = 0xFF; veth[2] = 0xFF;
+                veth[3] = 0xFF; veth[4] = 0xFF; veth[5] = 0xFF;
+            } else {
+                for (int i = 0; i < 6; i++) veth[i] = ioreq->ios2_DstAddr[i];
+            }
             for (int i = 0; i < 6; i++) eth[6 + i] = devBase->mac[i];
             uint16 etype = (uint16)(ioreq->ios2_PacketType & 0xFFFF);
             eth[12] = (UBYTE)(etype >> 8);
