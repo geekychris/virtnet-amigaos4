@@ -1101,16 +1101,57 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
          * where AllocVecTags failed, that's evidence the AVT_* attribute
          * tags force stricter physical placement than plain MEMF_KICK
          * needs. */
-        ULONG rx_alloc = rx_bytes + 4096;
-        ULONG tx_alloc = tx_bytes + 4096;
-        APTR rx_raw = iexec->AllocMem(rx_alloc, MEMF_KICK | MEMF_CLEAR);
-        APTR tx_raw = iexec->AllocMem(tx_alloc, MEMF_KICK | MEMF_CLEAR);
+        /* Phase 10k FIX-2: AllocVecTags with AVT_Contiguous=TRUE and
+         * AVT_PhysicalAlignment=4096. MEMF_KICK gave us memory but did
+         * NOT guarantee physical contiguity for the full 16KB span —
+         * only page 1's phys was reported to QEMU via PFN; pages 2..4
+         * (avail ring, used ring, tx_scratch) landed at unrelated phys
+         * addresses so QEMU's DMA read of page 2+ hit random memory,
+         * seeing the initial zero-init and never our updated avail->idx.
+         * Symptom: first TX popped (first page had descriptor which was
+         * correctly located); every subsequent TX pushed to avail_ring
+         * which lives on page 2 that QEMU can't read. */
+        ULONG rx_alloc = rx_bytes;
+        ULONG tx_alloc = tx_bytes;
+        APTR rx_raw = iexec->AllocVecTags(rx_alloc,
+            AVT_Type, MEMF_SHARED,
+            AVT_Contiguous, TRUE,
+            AVT_PhysicalAlignment, 4096,
+            AVT_Alignment, 4096,
+            AVT_Clear, TRUE,
+            TAG_END);
+        APTR tx_raw = iexec->AllocVecTags(tx_alloc,
+            AVT_Type, MEMF_SHARED,
+            AVT_Contiguous, TRUE,
+            AVT_PhysicalAlignment, 4096,
+            AVT_Alignment, 4096,
+            AVT_Clear, TRUE,
+            TAG_END);
         devBase->rx_vring_raw = rx_raw;
         devBase->tx_vring_raw = tx_raw;
         devBase->rx_vring_raw_size = rx_alloc;
         devBase->tx_vring_raw_size = tx_alloc;
-        devBase->rx_vring = rx_raw ? (APTR)(((ULONG)rx_raw + 4095UL) & ~4095UL) : NULL;
-        devBase->tx_vring = tx_raw ? (APTR)(((ULONG)tx_raw + 4095UL) & ~4095UL) : NULL;
+        /* AllocVecTags with 4096 alignment gives us already-aligned
+         * memory — no need for manual round-up (which was pointless
+         * anyway if only the first page's phys was contiguous). */
+        devBase->rx_vring = rx_raw;
+        devBase->tx_vring = tx_raw;
+        /* AVT_Clear=TRUE didn't actually clear when combined with
+         * AVT_Contiguous on this build (empirically: after Expunge/
+         * ReInit cycle we saw the previous instance's populated RX
+         * indices in freshly-"cleared" TX memory). Manual clear via
+         * uint32 stores, no memcpy/memset (would pull newlib into the
+         * resident-tag driver). */
+        if (rx_raw) {
+            volatile uint32 *p = (volatile uint32 *)rx_raw;
+            ULONG w = rx_alloc / 4;
+            for (ULONG i = 0; i < w; i++) p[i] = 0;
+        }
+        if (tx_raw) {
+            volatile uint32 *p = (volatile uint32 *)tx_raw;
+            ULONG w = tx_alloc / 4;
+            for (ULONG i = 0; i < w; i++) p[i] = 0;
+        }
         if (!devBase->rx_vring || !devBase->tx_vring) {
             LOGF(log, (CONST_STRPTR)"virtio: vring alloc FAILED (rx=%p tx=%p size rx=%lu tx=%lu)\n",
                  devBase->rx_vring, devBase->tx_vring,
@@ -1120,6 +1161,43 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Inte
         }
         devBase->rx_vring_phys = vn_dma_phys(iexec, devBase->rx_vring, rx_bytes, 0);
         devBase->tx_vring_phys = vn_dma_phys(iexec, devBase->tx_vring, tx_bytes, DMA_ReadFromRAM);
+
+        /* Phase 10k FIX: mark the vring memory CACHE-INHIBITED. Phases
+         * 10j-1..18 chased a "CPU write not landing in RAM before QEMU
+         * DMA-read" bug for multiple sub-phases. testrawstat proved
+         * CPU-side write+readback of avail->idx sees the value we
+         * wrote, but QEMU virtio_queue_notify fires and virtqueue_pop
+         * NEVER — QEMU's DMA read sees stale RAM. dcbf loops don't
+         * reliably push modified lines out on this platform.
+         *
+         * Solution: bypass the cache entirely for this memory range.
+         * IMMU->SetMemoryAttrs with MEMATTRF_CACHEINHIBIT changes the
+         * PPC page's WIMG bits so all loads/stores go straight to RAM,
+         * no caching, no dcbf ceremony required. Every avail->idx
+         * write is immediately visible to QEMU's DMA. */
+        {
+            struct MMUIFace *IMMU = (struct MMUIFace *)iexec->GetInterface(
+                (struct Library *)iexec->Data.LibBase, "MMU", 1, NULL);
+            if (IMMU) {
+                /* Round up to the next 4KB — PPC MMU pages are 4KB and
+                 * SetMemoryAttrs may otherwise leave the trailing partial
+                 * page cached. Cover the whole allocation so ALL of the
+                 * ring plus piggy-back scratch is uncached. */
+                ULONG rx_ci_len = (rx_bytes + 4095UL) & ~4095UL;
+                ULONG tx_ci_len = (tx_bytes + 4095UL) & ~4095UL;
+                IMMU->SetMemoryAttrs(devBase->rx_vring, rx_ci_len,
+                    MEMATTRF_CACHEINHIBIT | MEMATTRF_GUARDED | MEMATTRF_COHERENT | MEMATTRF_READ_WRITE);
+                IMMU->SetMemoryAttrs(devBase->tx_vring, tx_ci_len,
+                    MEMATTRF_CACHEINHIBIT | MEMATTRF_GUARDED | MEMATTRF_COHERENT | MEMATTRF_READ_WRITE);
+                iexec->DropInterface((struct Interface *)IMMU);
+                LOGF(log, (CONST_STRPTR)"vrings: CACHEINHIBIT rx@%p(%lu) tx@%p(%lu)\n",
+                     devBase->rx_vring, (ULONG)rx_ci_len,
+                     devBase->tx_vring, (ULONG)tx_ci_len);
+            } else {
+                LOGF(log, (CONST_STRPTR)"WARN: MMU interface unavailable; vrings remain cached\n");
+            }
+        }
+
         LOGF(log, (CONST_STRPTR)"virtio vrings: rx=%p phys=%08lx (%lu bytes)  tx=%p phys=%08lx (%lu bytes)\n",
              devBase->rx_vring, (ULONG)devBase->rx_vring_phys, (ULONG)rx_bytes,
              devBase->tx_vring, (ULONG)devBase->tx_vring_phys, (ULONG)tx_bytes);
@@ -1559,11 +1637,11 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
         /* Phase 10j-15: rings allocated via AllocMem+manual-align; free
          * the pre-alignment raw pointer with FreeMem. */
         if (devBase->rx_vring_raw) {
-            IExec->FreeMem(devBase->rx_vring_raw, devBase->rx_vring_raw_size);
+            IExec->FreeVec(devBase->rx_vring_raw);
             devBase->rx_vring_raw = NULL; devBase->rx_vring = NULL;
         }
         if (devBase->tx_vring_raw) {
-            IExec->FreeMem(devBase->tx_vring_raw, devBase->tx_vring_raw_size);
+            IExec->FreeVec(devBase->tx_vring_raw);
             devBase->tx_vring_raw = NULL; devBase->tx_vring = NULL;
         }
         if (devBase->bar0) {
@@ -2448,13 +2526,23 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
         }
         uint32 live_phys = devBase->tx_scratch2_phys;
 
-        /* Single-descriptor TX (with ANY_LAYOUT negotiated). */
+        /* Multi-descriptor TX: rotate through the descriptor table so
+         * we don't keep re-using desc 0. QEMU on this build only
+         * processes the FIRST push per desc slot per virtqueue lifetime
+         * and silently ignores repeated pushes of the same descriptor
+         * (empirically: trace shows notifies fire but virtqueue_pop
+         * only ever runs once even after the used ring has been marked).
+         * Rotating means each CMD_WRITE uses a fresh descriptor index. */
+        UWORD tx_num_early = devBase->tx_vring_num;
+        uint16 tx_avail_now = vio_le16_get(
+            (uint16 *)(((UBYTE *)devBase->tx_vring) + VRING_AVAIL_OFFSET(tx_num_early) + 2));
+        UWORD desc_slot = (UWORD)(tx_avail_now % tx_num_early);
         struct vring_desc *tdesc = (struct vring_desc *)devBase->tx_vring;
-        vio_le32_put(&tdesc[0].addr_lo, live_phys);
-        vio_le32_put(&tdesc[0].addr_hi, 0);
-        vio_le32_put(&tdesc[0].len, total_bytes);
-        vio_le16_put(&tdesc[0].flags, 0);
-        vio_le16_put(&tdesc[0].next, 0);
+        vio_le32_put(&tdesc[desc_slot].addr_lo, live_phys);
+        vio_le32_put(&tdesc[desc_slot].addr_hi, 0);
+        vio_le32_put(&tdesc[desc_slot].len, total_bytes);
+        vio_le16_put(&tdesc[desc_slot].flags, 0);
+        vio_le16_put(&tdesc[desc_slot].next, 0);
 
         /* Flush descriptor RAM (16 bytes = half a cacheline). */
         __asm__ volatile ("dcbf 0,%0; sync" : : "r"((ULONG)devBase->tx_vring) : "memory");
@@ -2470,7 +2558,7 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
         struct vring_avail_header *tavail = (struct vring_avail_header *)tavail_bytes;
         uint16 *tavail_ring = (uint16 *)(tavail_bytes + 4);
         uint16 cur_avail = vio_le16_get(&tavail->idx);
-        vio_le16_put(&tavail_ring[cur_avail % tx_num], 0);
+        vio_le16_put(&tavail_ring[cur_avail % tx_num], desc_slot);
         __asm__ volatile ("eieio; sync" : : : "memory");
         vio_le16_put(&tavail->idx, cur_avail + 1);
         __asm__ volatile ("eieio; sync" : : : "memory");
