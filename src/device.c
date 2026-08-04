@@ -1981,6 +1981,38 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
          * the driver task died. */
         ioreq->ios2_DstAddr[12] = (UBYTE)(devBase->last_dispatched_cmd >> 8);
         ioreq->ios2_DstAddr[13] = (UBYTE)(devBase->last_dispatched_cmd);
+        /* Overload SrcAddr[6..15] + DstAddr[14..15] to carry TX ring
+         * diagnostic set by CMD_WRITE:
+         *   SrcAddr[6..9]   = tavail address (last write target)
+         *   SrcAddr[10..11] = written idx (what we tried to store)
+         *   SrcAddr[12..13] = readback idx (what CPU sees after write)
+         *   SrcAddr[14..15] = TX used->idx (what QEMU has confirmed)
+         *   DstAddr[14..15] = TX avail_ring[0] (descriptor idx written) */
+        ULONG tap = (ULONG)devBase->last_copy_to_ptr;
+        ioreq->ios2_SrcAddr[6]  = (UBYTE)(tap >> 24);
+        ioreq->ios2_SrcAddr[7]  = (UBYTE)(tap >> 16);
+        ioreq->ios2_SrcAddr[8]  = (UBYTE)(tap >> 8);
+        ioreq->ios2_SrcAddr[9]  = (UBYTE)(tap);
+        ULONG w = devBase->last_copy_to_tag;
+        ioreq->ios2_SrcAddr[10] = (UBYTE)(w >> 8);
+        ioreq->ios2_SrcAddr[11] = (UBYTE)(w);
+        ULONG r = devBase->last_copy_to_size;
+        ioreq->ios2_SrcAddr[12] = (UBYTE)(r >> 8);
+        ioreq->ios2_SrcAddr[13] = (UBYTE)(r);
+        /* TX used-idx from actual ring memory (if TX vring exists). */
+        if (devBase->tx_vring) {
+            UWORD tnum = devBase->tx_vring_num;
+            UBYTE *tused_b = ((UBYTE *)devBase->tx_vring) + VRING_USED_OFFSET(tnum);
+            struct vring_used_header *tused = (struct vring_used_header *)tused_b;
+            UWORD tused_idx = vio_le16_get(&tused->idx);
+            ioreq->ios2_SrcAddr[14] = (UBYTE)(tused_idx >> 8);
+            ioreq->ios2_SrcAddr[15] = (UBYTE)(tused_idx);
+            UBYTE *tavail_b = ((UBYTE *)devBase->tx_vring) + VRING_AVAIL_OFFSET(tnum);
+            uint16 *tavail_ring = (uint16 *)(tavail_b + 4);
+            UWORD desc_idx = vio_le16_get(&tavail_ring[0]);
+            ioreq->ios2_DstAddr[14] = (UBYTE)(desc_idx >> 8);
+            ioreq->ios2_DstAddr[15] = (UBYTE)(desc_idx);
+        }
         break;
     }
 
@@ -2442,8 +2474,35 @@ static void vn_dispatch_ioreq(struct VirtnetBase *devBase, struct IOSana2Req *io
         __asm__ volatile ("eieio; sync" : : : "memory");
         vio_le16_put(&tavail->idx, cur_avail + 1);
         __asm__ volatile ("eieio; sync" : : : "memory");
-        /* Flush avail ring changes to RAM before the doorbell. */
-        IExec->CacheClearE(tavail_bytes, 4 + 2 * tx_num, CACRF_ClearD);
+        /* DIAGNOSTIC: record wrote vs readback so DBG_STATUS can show
+         * whether our write is visible to our own read. If they differ,
+         * something is very wrong with memory or the cache path. If they
+         * match but QEMU still doesn't see the new idx, the cache-to-RAM
+         * flush is broken. Overload last_copy_to_ptr = tavail address,
+         * last_copy_to_tag = written value, last_copy_to_size = readback. */
+        {
+            uint16 readback = vio_le16_get(&tavail->idx);
+            devBase->last_copy_to_ptr  = (APTR)tavail;
+            devBase->last_copy_to_tag  = (ULONG)(cur_avail + 1);
+            devBase->last_copy_to_size = (ULONG)readback;
+        }
+        /* Flush avail ring changes to RAM before the doorbell. Phase
+         * 10j-17 established CacheClearE alone doesn't reach RAM
+         * reliably on this platform; use explicit dcbf per cacheline
+         * (PPC 460EX = 32-byte lines) followed by sync — same pattern
+         * the descriptor and tx_scratch2 flushes above use. Without
+         * this, QEMU's virtio_notify fires (trace shows it) but
+         * virtqueue_pop finds avail->idx unchanged and no descriptor
+         * is processed — the pcap stays empty. */
+        {
+            ULONG avail_start = (ULONG)tavail_bytes & ~31UL;
+            ULONG avail_len   = 4UL + 2UL * tx_num;
+            ULONG avail_end   = ((ULONG)tavail_bytes + avail_len + 31UL) & ~31UL;
+            for (ULONG a = avail_start; a < avail_end; a += 32) {
+                __asm__ volatile ("dcbf 0,%0" : : "r"(a) : "memory");
+            }
+            __asm__ volatile ("sync; eieio" : : : "memory");
+        }
         virtio_notify_queue(devBase, VIRTIO_NET_Q_TX);
 
         /* Poll TX used ring briefly for completion. */
