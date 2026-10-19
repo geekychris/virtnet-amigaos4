@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Virtnet Amigaos4 logo" width="180">
+</p>
+
 # virtnet.device — virtio-net driver for AmigaOS 4
 
 A SANA-II network device driver for the **virtio-net-pci** paravirtualized
